@@ -16667,6 +16667,19 @@ async fn assemble_channel_agent_tools(
     }
 }
 
+/// A channel agent's hook runner: the configured hooks when `[hooks]` is enabled,
+/// plus the embedder's, which apply whether or not it is.
+fn channel_hook_runner(
+    config: &Config,
+    embedder_hooks: &zeroclaw_runtime::hooks::EmbedderHooks,
+) -> Option<Arc<zeroclaw_runtime::hooks::HookRunner>> {
+    let configured = config
+        .hooks
+        .enabled
+        .then(|| zeroclaw_runtime::hooks::HookRunner::from_root_config(config));
+    embedder_hooks.hook_runner(configured).map(Arc::new)
+}
+
 /// Compose a channel agent's post-assembly MCP prompt sections in the order the
 /// system prompt requires: apply the strict text-tool suppression policy to ONLY
 /// the deferred/tool-search section, then append the pinned MCP resource section
@@ -16915,6 +16928,7 @@ pub async fn start_channels_with_authority(
         sop_audit,
         None,
         sop_driver_sink,
+        zeroclaw_runtime::hooks::EmbedderHooks::default(),
     ))
     .await
 }
@@ -16943,6 +16957,7 @@ pub async fn start_channels_with_plugin_webhooks(
         sop_audit,
         plugin_webhooks,
         sop_driver_sink,
+        zeroclaw_runtime::hooks::EmbedderHooks::default(),
     )
     .await
 }
@@ -16961,7 +16976,8 @@ tokio::task_local! {
 }
 
 /// Start supervised channels with the shared live-config authority and the
-/// daemon generation's plugin-webhook route registry.
+/// daemon generation's plugin-webhook route registry. `embedder_hooks` joins
+/// every agent's hook runner, whether or not `[hooks]` is enabled.
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels_with_authority_and_plugin_webhooks(
     authority: zeroclaw_runtime::LiveConfigAuthority,
@@ -16971,6 +16987,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
     sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
+    embedder_hooks: zeroclaw_runtime::hooks::EmbedderHooks,
 ) -> Result<()> {
     let plugin_webhook_registry_lease = plugin_webhooks
         .as_ref()
@@ -17596,13 +17613,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             media_pipeline: config.media_pipeline.clone(),
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
-            hooks: if config.hooks.enabled {
-                Some(Arc::new(
-                    zeroclaw_runtime::hooks::HookRunner::from_root_config(&config),
-                ))
-            } else {
-                None
-            },
+            hooks: channel_hook_runner(&config, &embedder_hooks),
             non_cli_excluded_tools: Arc::new(risk_profile.excluded_tools.clone()),
             autonomy_level: risk_profile.level,
             tool_call_dedup_exempt: Arc::new(agent.resolved.tool_call_dedup_exempt.clone()),
@@ -31787,6 +31798,141 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             !reply.suppress_voice,
             "the conversational reply must keep its default voice routing, got {reply:?}"
+        );
+    }
+
+    /// `mock_price` that counts its executions.
+    struct CountingPriceTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingPriceTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "mock_price"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CountingPriceTool {
+        fn name(&self) -> &str {
+            "mock_price"
+        }
+        fn description(&self) -> &str {
+            "Return a mocked BTC price"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": { "symbol": { "type": "string" } } })
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// An embedder hook that records each tool call it sees and, when `cancel`
+    /// is set, refuses it.
+    struct EmbedderProbeHook {
+        before_tool_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        cancel: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for EmbedderProbeHook {
+        fn name(&self) -> &str {
+            "embedder-probe"
+        }
+        async fn before_tool_call(
+            &self,
+            name: String,
+            args: serde_json::Value,
+        ) -> zeroclaw_runtime::hooks::HookResult<(String, serde_json::Value)> {
+            self.before_tool_calls.lock().unwrap().push(name.clone());
+            if self.cancel {
+                return zeroclaw_runtime::hooks::HookResult::Cancel(
+                    "refused by the embedder".into(),
+                );
+            }
+            zeroclaw_runtime::hooks::HookResult::Continue((name, args))
+        }
+    }
+
+    /// Run one chat turn whose model calls `mock_price`, with an embedder hook and
+    /// `[hooks]` disabled. Returns how often the tool ran and the calls the hook saw.
+    async fn chat_turn_with_embedder_hook(cancel: bool) -> (usize, Vec<String>) {
+        let before_tool_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder_hooks =
+            zeroclaw_runtime::hooks::EmbedderHooks::new().with(Arc::new(EmbedderProbeHook {
+                before_tool_calls: Arc::clone(&before_tool_calls),
+                cancel,
+            }));
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.hooks.enabled = false;
+        let hooks = channel_hook_runner(&config, &embedder_hooks);
+        assert!(
+            hooks.is_some(),
+            "embedder hooks apply with [hooks] disabled"
+        );
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let channel: Arc<dyn Channel> = Arc::new(SendMessageRecordingChannel::default());
+        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            hooks,
+            Arc::new(NoopObserver),
+            vec![Box::new(CountingPriceTool(Arc::clone(&executions)))],
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".into(),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let seen = before_tool_calls.lock().unwrap().clone();
+        (executions.load(std::sync::atomic::Ordering::SeqCst), seen)
+    }
+
+    #[tokio::test]
+    async fn chat_turn_fires_the_embedder_hook_before_a_tool_call() {
+        let (executions, seen) = chat_turn_with_embedder_hook(false).await;
+        assert_eq!(seen, ["mock_price"]);
+        assert_eq!(executions, 1, "a continuing hook lets the call run");
+    }
+
+    #[tokio::test]
+    async fn chat_turn_lets_the_embedder_hook_refuse_a_tool_call() {
+        let (executions, seen) = chat_turn_with_embedder_hook(true).await;
+        assert_eq!(seen, ["mock_price"]);
+        assert_eq!(
+            executions, 0,
+            "a cancelling hook keeps the call from running"
+        );
+    }
+
+    #[test]
+    fn channel_hook_runner_is_none_without_configured_or_embedder_hooks() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.hooks.enabled = false;
+        assert!(
+            channel_hook_runner(&config, &zeroclaw_runtime::hooks::EmbedderHooks::default())
+                .is_none()
         );
     }
 

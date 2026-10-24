@@ -10810,6 +10810,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     sop_audit,
                                     plugin_webhooks,
                                     sop_driver_sink,
+                                    zeroclaw_runtime::hooks::EmbedderHooks::default(),
                                 ),
                             )
                             .await

@@ -7,6 +7,7 @@ use crate::cron::{
     clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
     sync_declarative_jobs,
 };
+use crate::hooks::EmbedderHooks;
 use crate::live_config_authority::{
     AgentExecutionAdmission, AgentExecutionCapability, AgentExecutionSelection,
 };
@@ -444,14 +445,17 @@ pub async fn run(
     event_tx: EventBroadcast,
     cancel: CancellationToken,
 ) -> Result<()> {
-    run_with_capability(config, event_tx, cancel, None).await
+    run_with_capability(config, event_tx, cancel, None, EmbedderHooks::default()).await
 }
 
+/// Run the scheduler loop. `embedder_hooks` joins the hook runner of every agent job
+/// the loop runs, catch-up runs included.
 pub async fn run_with_capability(
     config: Config,
     event_tx: EventBroadcast,
     cancel: CancellationToken,
     execution_capability: Option<AgentExecutionCapability>,
+    embedder_hooks: EmbedderHooks,
 ) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
@@ -529,7 +533,13 @@ pub async fn run_with_capability(
     }
 
     if config.scheduler.catch_up_on_startup {
-        catch_up_overdue_jobs(&config, &event_tx, execution_capability.clone()).await;
+        catch_up_overdue_jobs(
+            &config,
+            &event_tx,
+            execution_capability.clone(),
+            &embedder_hooks,
+        )
+        .await;
     } else {
         ::zeroclaw_log::record!(
             INFO,
@@ -572,6 +582,7 @@ pub async fn run_with_capability(
                     SCHEDULER_COMPONENT,
                     &event_tx,
                     execution_selection,
+                    &embedder_hooks,
                 )
                 .await;
             }
@@ -627,6 +638,7 @@ async fn catch_up_overdue_jobs(
     config: &Config,
     event_tx: &EventBroadcast,
     execution_capability: Option<AgentExecutionCapability>,
+    embedder_hooks: &EmbedderHooks,
 ) {
     let execution_selection = execution_capability
         .as_ref()
@@ -673,6 +685,7 @@ async fn catch_up_overdue_jobs(
         SCHEDULER_COMPONENT,
         event_tx,
         execution_selection,
+        embedder_hooks,
     )
     .await;
 
@@ -787,6 +800,8 @@ async fn execute_job_now_with_runtime(
         Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
     };
     let span = zeroclaw_log::attribution_span!(job);
+    // A manual run (the `cron_run` tool, the gateway, RPC) carries no embedder
+    // hooks: only the scheduler loop is handed them.
     Box::pin(execute_job_with_retry(
         config,
         &security,
@@ -795,6 +810,7 @@ async fn execute_job_now_with_runtime(
         runtime,
         approved,
         execution_admission,
+        &EmbedderHooks::default(),
     ))
     .instrument(span)
     .await
@@ -830,6 +846,7 @@ async fn execute_job_with_retry(
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
     execution_admission: Option<AgentExecutionAdmission>,
+    embedder_hooks: &EmbedderHooks,
 ) -> (bool, String) {
     if let Some(admission) = execution_admission.as_ref()
         && let Err(error) = admission.revalidate()
@@ -873,6 +890,7 @@ async fn execute_job_with_retry(
                     agent_alias,
                     job,
                     execution_admission.clone(),
+                    embedder_hooks,
                 ))
                 .await
             }
@@ -933,6 +951,7 @@ async fn process_due_jobs(
     component: &str,
     event_tx: &EventBroadcast,
     execution_selection: Option<AgentExecutionSelection>,
+    embedder_hooks: &EmbedderHooks,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -971,6 +990,7 @@ async fn process_due_jobs(
         };
         let config = execution_config;
         let component = component.to_owned();
+        let embedder_hooks = embedder_hooks.clone();
         Some(async move {
             let result = Box::pin(execute_and_persist_job(
                 &config,
@@ -979,6 +999,7 @@ async fn process_due_jobs(
                 &job,
                 &component,
                 execution_admission.clone(),
+                &embedder_hooks,
             ))
             .await;
             (result, execution_admission)
@@ -1016,6 +1037,7 @@ async fn execute_and_persist_job(
     job: &CronJob,
     component: &str,
     execution_admission: Option<AgentExecutionAdmission>,
+    embedder_hooks: &EmbedderHooks,
 ) -> (String, bool, String) {
     if let Some(admission) = execution_admission.as_ref()
         && let Err(error) = admission.revalidate()
@@ -1045,6 +1067,7 @@ async fn execute_and_persist_job(
         None,
         false,
         execution_admission.clone(),
+        embedder_hooks,
     ))
     .instrument(span)
     .await;
@@ -1088,6 +1111,7 @@ async fn run_agent_job(
     agent_alias: &str,
     job: &CronJob,
     execution_admission: Option<AgentExecutionAdmission>,
+    embedder_hooks: &EmbedderHooks,
 ) -> (bool, String) {
     if !security.can_act() {
         return (
@@ -1160,6 +1184,7 @@ async fn run_agent_job(
         // A `[[cron]]` job runs a prompt, not a SOP step. SOP cron triggers
         // are a separate surface driven by the SOP maintenance tick.
         sop_step_scope: None,
+        embedder_hooks: embedder_hooks.clone(),
         ..crate::agent::loop_::AgentRunOverrides::default()
     };
     let run_result = match job.session_target {
@@ -2508,6 +2533,7 @@ mod tests {
             None,
             false,
             None,
+            &EmbedderHooks::default(),
         ))
         .await;
         assert!(success);
@@ -2533,6 +2559,7 @@ mod tests {
             None,
             false,
             None,
+            &EmbedderHooks::default(),
         ))
         .await;
         assert!(!success);
@@ -2581,8 +2608,15 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            None,
+            &EmbedderHooks::default(),
+        ))
+        .await;
         assert!(!success);
         assert!(!output.trim().is_empty());
         assert!(!output.contains("agent job failed:"));
@@ -2669,8 +2703,15 @@ mod tests {
             ..Default::default()
         };
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            None,
+            &EmbedderHooks::default(),
+        ))
+        .await;
         assert!(!success);
         let expected = crate::i18n::get_required_cli_string("turn-context-window-exceeded-error");
         assert_eq!(output, expected);
@@ -2811,6 +2852,7 @@ mod tests {
             None,
             false,
             admission.clone(),
+            &EmbedderHooks::default(),
         ))
         .await;
         assert!(success, "retrying cron agent run failed: {output}");
@@ -2822,6 +2864,7 @@ mod tests {
             TEST_AGENT,
             &job,
             admission.clone(),
+            &EmbedderHooks::default(),
         ))
         .await;
         assert!(
@@ -2830,10 +2873,32 @@ mod tests {
             sequential.1
         );
 
+        let embedder_hooks = EmbedderHooks::default();
         let (concurrent_a, concurrent_b, concurrent_c) = tokio::join!(
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
+            run_agent_job(
+                &config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone(),
+                &embedder_hooks
+            ),
+            run_agent_job(
+                &config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone(),
+                &embedder_hooks
+            ),
+            run_agent_job(
+                &config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone(),
+                &embedder_hooks
+            ),
         );
         for result in [concurrent_a, concurrent_b, concurrent_c] {
             assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
@@ -2865,6 +2930,165 @@ mod tests {
         server.abort();
     }
 
+    /// An embedder hook that records each tool call it sees and, when `cancel`
+    /// is set, refuses it.
+    struct EmbedderProbeHook {
+        before_tool_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        cancel: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for EmbedderProbeHook {
+        fn name(&self) -> &str {
+            "embedder-probe"
+        }
+        async fn before_tool_call(
+            &self,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            self.before_tool_calls.lock().unwrap().push(name.clone());
+            if self.cancel {
+                return crate::hooks::HookResult::Cancel("refused by the embedder".into());
+            }
+            crate::hooks::HookResult::Continue((name, args))
+        }
+    }
+
+    fn embedder_probe_hooks(cancel: bool) -> (EmbedderHooks, Arc<std::sync::Mutex<Vec<String>>>) {
+        let before_tool_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = EmbedderProbeHook {
+            before_tool_calls: Arc::clone(&before_tool_calls),
+            cancel,
+        };
+        (EmbedderHooks::new().with(Arc::new(hook)), before_tool_calls)
+    }
+
+    const SHELL_PROBE_OUTPUT: &str = "EMBEDDER_HOOK_SHELL_RAN";
+
+    /// A model that asks for one `shell` call echoing [`SHELL_PROBE_OUTPUT`], then
+    /// answers "done". Collects the tool results it is sent.
+    async fn shell_calling_model() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, routing::post};
+        let tool_results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool_results_for_handler = Arc::clone(&tool_results);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let results: Vec<String> = body["messages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                    })
+                    .filter_map(|message| message.get("content")?.as_str().map(str::to_string))
+                    .collect();
+                let has_tool_result = !results.is_empty();
+                tool_results_for_handler.lock().unwrap().extend(results);
+                let arguments =
+                    serde_json::json!({ "command": format!("echo {SHELL_PROBE_OUTPUT}") })
+                        .to_string();
+                async move {
+                    if has_tool_result {
+                        return Json(
+                            serde_json::json!({ "choices": [{"message": {"content": "done"}}] }),
+                        );
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call-shell",
+                                    "type": "function",
+                                    "function": { "name": "shell", "arguments": arguments }
+                                }]
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, tool_results, server)
+    }
+
+    /// Run one agent cron job against a model that calls `shell` once. Returns
+    /// whether the shell command ran and the tool calls the embedder hook saw.
+    async fn run_shell_job_with_embedder_hook(cancel: bool) -> (bool, Vec<String>) {
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+        let tmp = TempDir::new().unwrap();
+        let (address, tool_results, server) = shell_calling_model().await;
+        let mut config = test_config(&tmp).await;
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.reliability.scheduler_retries = 0;
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("embedder-hook-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
+        config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
+            crate::security::AutonomyLevel::Full;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Write the marker".into());
+        job.allowed_tools = Some(vec!["shell".into()]);
+        job.uses_memory = false;
+        let (embedder_hooks, before_tool_calls) = embedder_probe_hooks(cancel);
+
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &test_security(&config),
+            TEST_AGENT,
+            &job,
+            None,
+            &embedder_hooks,
+        ))
+        .await;
+
+        server.abort();
+        assert!(success, "cron agent run failed: {output}");
+        let seen = before_tool_calls.lock().unwrap().clone();
+        let shell_ran = tool_results
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|result| result.contains(SHELL_PROBE_OUTPUT) && !result.contains("echo"));
+        (shell_ran, seen)
+    }
+
+    #[tokio::test]
+    async fn agent_cron_run_fires_the_embedder_hook_before_a_tool_call() {
+        let (shell_ran, seen) = run_shell_job_with_embedder_hook(false).await;
+        assert_eq!(seen, ["shell"]);
+        assert!(shell_ran, "a continuing hook lets the call run");
+    }
+
+    #[tokio::test]
+    async fn agent_cron_run_lets_the_embedder_hook_refuse_a_tool_call() {
+        let (shell_ran, seen) = run_shell_job_with_embedder_hook(true).await;
+        assert_eq!(seen, ["shell"]);
+        assert!(!shell_ran, "a cancelling hook keeps the call from running");
+    }
+
     #[tokio::test]
     async fn run_agent_job_blocks_readonly_mode() {
         let tmp = TempDir::new().unwrap();
@@ -2879,8 +3103,15 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            None,
+            &EmbedderHooks::default(),
+        ))
+        .await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -2900,8 +3131,15 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            None,
+            &EmbedderHooks::default(),
+        ))
+        .await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -2914,7 +3152,15 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, Vec::new(), &component, &None, None).await;
+        process_due_jobs(
+            &config,
+            Vec::new(),
+            &component,
+            &None,
+            None,
+            &EmbedderHooks::default(),
+        )
+        .await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -2968,7 +3214,15 @@ mod tests {
             } else {
                 let claimed = claim_due_jobs(&config, vec![selected_job]);
                 assert_eq!(claimed.len(), 1);
-                process_due_jobs(&config, claimed, "stale-cron", &events, Some(selection)).await;
+                process_due_jobs(
+                    &config,
+                    claimed,
+                    "stale-cron",
+                    &events,
+                    Some(selection),
+                    &EmbedderHooks::default(),
+                )
+                .await;
                 assert!(
                     claim_job(&config, &job.id, Utc::now()).unwrap(),
                     "stale rejection releases claim"
@@ -3061,6 +3315,7 @@ mod tests {
             &job,
             "closed-cron",
             Some(admission),
+            &EmbedderHooks::default(),
         )
         .await;
         assert!(!success);
@@ -3078,7 +3333,15 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, vec![job], &component, &None, None).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &None,
+            None,
+            &EmbedderHooks::default(),
+        )
+        .await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -3964,6 +4227,7 @@ mod tests {
                         "admission-delivery",
                         &None,
                         Some(selection),
+                        &EmbedderHooks::default(),
                     )
                     .await;
                 }
@@ -4290,7 +4554,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx, None).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &event_tx,
+            None,
+            &EmbedderHooks::default(),
+        )
+        .await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -4316,7 +4588,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx, None).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &event_tx,
+            None,
+            &EmbedderHooks::default(),
+        )
+        .await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -4378,6 +4658,7 @@ mod tests {
             &unique_component("orphan"),
             &None,
             None,
+            &EmbedderHooks::default(),
         )
         .await;
 
@@ -4452,6 +4733,7 @@ mod tests {
             &unique_component("contested"),
             &None,
             None,
+            &EmbedderHooks::default(),
         )
         .await;
         assert!(
@@ -4519,6 +4801,7 @@ mod tests {
             &unique_component("sole"),
             &None,
             None,
+            &EmbedderHooks::default(),
         )
         .await;
 
@@ -4539,7 +4822,15 @@ mod tests {
         let component = unique_component("broadcast-none");
 
         // event_tx = None — should complete without panic.
-        process_due_jobs(&config, vec![job], &component, &None, None).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &None,
+            None,
+            &EmbedderHooks::default(),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4554,7 +4845,15 @@ mod tests {
         // process_due_jobs must not panic when there are no subscribers.
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx, None).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &event_tx,
+            None,
+            &EmbedderHooks::default(),
+        )
+        .await;
         // If we got here without panic, the test passes.
     }
 }

@@ -102,6 +102,9 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
         // nested dispatch belong to the reply-provenance slice of the
         // internal-turn contract; until then absence is explicit.
         internal_principal: None,
+        // Not propagated either: this tool does not hold the parent run's
+        // embedder hooks, so a child runs without them.
+        embedder_hooks: crate::hooks::EmbedderHooks::default(),
     }
 }
 
