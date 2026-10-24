@@ -1461,6 +1461,9 @@ pub struct AgentRunOverrides {
     /// inherits the step's boundary rather than rebuilding the agent's full
     /// surface. `None` for every ordinary agent run.
     pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
+    /// Hooks the embedding binary adds to this run; they are the run's hook
+    /// runner. Empty by default, which keeps the run hook-free as before.
+    pub embedder_hooks: crate::hooks::EmbedderHooks,
 }
 
 fn agent_provider_composite(
@@ -1836,6 +1839,7 @@ async fn run_inner(
         } else {
             Vec::new()
         };
+        let hook_runner = overrides.embedder_hooks.hook_runner(None);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
@@ -2462,7 +2466,7 @@ async fn run_inner(
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
                                         config: Some(&config),
-                                        hooks: None,
+                                        hooks: hook_runner.as_ref(),
                                         activated_tools: activated_handle.as_ref(),
                                         model_switch_callback: None,
                                         receipt_generator: None,
@@ -3116,7 +3120,7 @@ async fn run_inner(
                                             approval: approval_manager.as_ref(),
                                             multimodal_config: &config.multimodal,
                                             config: Some(&config),
-                                            hooks: None,
+                                            hooks: hook_runner.as_ref(),
                                             activated_tools: activated_handle.as_ref(),
                                             model_switch_callback: None,
                                             receipt_generator: None,

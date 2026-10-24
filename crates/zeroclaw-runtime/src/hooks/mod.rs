@@ -1,7 +1,9 @@
 pub mod builtin;
+mod embedder;
 mod runner;
 mod traits;
 
+pub use embedder::EmbedderHooks;
 pub use runner::HookRunner;
 pub(crate) use runner::{split_tool_call_decision, tool_call_hook_context};
 // These types are part of the crate's public hook API surface.

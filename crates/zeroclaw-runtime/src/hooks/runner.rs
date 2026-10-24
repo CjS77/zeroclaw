@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -69,7 +70,7 @@ fn join_tool_call_decision(
 }
 
 pub struct HookRunner {
-    handlers: Vec<Box<dyn HookHandler>>,
+    handlers: Vec<Arc<dyn HookHandler>>,
 }
 
 static LEGACY_TOOL_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -95,6 +96,12 @@ impl HookRunner {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.handlers.is_empty()
+    }
+
+    /// Handler names in dispatch order, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn handler_names(&self) -> Vec<&str> {
+        self.handlers.iter().map(|h| h.name()).collect()
     }
 
     pub fn from_config(hooks: &zeroclaw_config::schema::HooksConfig) -> Self {
@@ -166,6 +173,12 @@ impl HookRunner {
 
     /// Register a handler and re-sort by descending priority.
     pub fn register(&mut self, handler: Box<dyn HookHandler>) {
+        self.register_shared(Arc::from(handler));
+    }
+
+    /// Register a handler that other runners also hold, such as an embedder's
+    /// hook shared by every agent and turn, and re-sort by descending priority.
+    pub fn register_shared(&mut self, handler: Arc<dyn HookHandler>) {
         self.handlers.push(handler);
         self.handlers
             .sort_by_key(|h| std::cmp::Reverse(h.priority()));

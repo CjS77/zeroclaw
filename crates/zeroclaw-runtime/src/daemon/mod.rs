@@ -1348,6 +1348,7 @@ pub async fn run_with_authority(
                         Some(tx),
                         cancel,
                         Some(execution_capability),
+                        crate::hooks::EmbedderHooks::default(),
                     ))
                     .await
                 }
