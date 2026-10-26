@@ -1275,13 +1275,14 @@ async fn handle_socket(
                         tool_name,
                         arguments_summary,
                         timeout_secs,
-                    } => serde_json::json!({
-                        "type": "approval_request",
-                        "request_id": request_id,
-                        "tool": tool_name,
-                        "arguments_summary": arguments_summary,
-                        "timeout_secs": timeout_secs,
-                    }),
+                        reason,
+                    } => approval_request_frame(
+                        &request_id,
+                        &tool_name,
+                        &arguments_summary,
+                        timeout_secs,
+                        reason.as_deref(),
+                    ),
                     other => {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": format!("{:?}", other)})), "non-ApprovalRequest event leaked into approval channel");
                         continue;
@@ -1633,6 +1634,28 @@ enum ClientFrame {
     /// Close frame, transport error, or end of stream: the viewer is gone.
     /// This does not cancel the turn; see `process_chat_message`.
     Gone,
+}
+
+/// The `approval_request` frame sent to a WebSocket client. `reason` is
+/// omitted when absent, so a frame without one is unchanged.
+fn approval_request_frame(
+    request_id: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+    timeout_secs: u64,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut frame = serde_json::json!({
+        "type": "approval_request",
+        "request_id": request_id,
+        "tool": tool_name,
+        "arguments_summary": arguments_summary,
+        "timeout_secs": timeout_secs,
+    });
+    if let Some(reason) = reason {
+        frame["reason"] = serde_json::Value::from(reason);
+    }
+    frame
 }
 
 fn classify_client_frame(frame: Option<Result<Message, axum::Error>>) -> ClientFrame {
@@ -2355,6 +2378,7 @@ async fn process_chat_message(
                                     tool_name,
                                     arguments_summary,
                                     timeout_secs,
+                                    reason,
                                 } = event {
                                     if client_gone {
                                         // Nobody is attached to answer: drop the parked
@@ -2363,13 +2387,13 @@ async fn process_chat_message(
                                         drop(pending_approvals.lock().remove(&request_id));
                                         continue;
                                     }
-                                    let frame = serde_json::json!({
-                                        "type": "approval_request",
-                                        "request_id": request_id,
-                                        "tool": tool_name,
-                                        "arguments_summary": arguments_summary,
-                                        "timeout_secs": timeout_secs,
-                                    });
+                                    let frame = approval_request_frame(
+                                        &request_id,
+                                        &tool_name,
+                                        &arguments_summary,
+                                        timeout_secs,
+                                        reason.as_deref(),
+                                    );
                                     send_to_viewer!(Message::Text(frame.to_string().into()));
                                 }
                             }
@@ -2408,18 +2432,19 @@ async fn process_chat_message(
                                         tool_name,
                                         arguments_summary,
                                         timeout_secs,
+                                        reason,
                                     } => {
                                         if client_gone {
                                             drop(pending_approvals.lock().remove(&request_id));
                                             continue;
                                         }
-                                        serde_json::json!({
-                                            "type": "approval_request",
-                                            "request_id": request_id,
-                                            "tool": tool_name,
-                                            "arguments_summary": arguments_summary,
-                                            "timeout_secs": timeout_secs,
-                                        })
+                                        approval_request_frame(
+                                            &request_id,
+                                            &tool_name,
+                                            &arguments_summary,
+                                            timeout_secs,
+                                            reason.as_deref(),
+                                        )
                                     }
                                     TurnEvent::HistoryTrimmed {
                                         dropped_messages,
@@ -2842,6 +2867,26 @@ mod tests {
         routing::{get, post},
     };
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[test]
+    fn approval_request_frame_carries_the_reason_only_when_present() {
+        let without = approval_request_frame("r1", "shell", "ls", 30, None);
+        assert_eq!(
+            without,
+            serde_json::json!({
+                "type": "approval_request",
+                "request_id": "r1",
+                "tool": "shell",
+                "arguments_summary": "ls",
+                "timeout_secs": 30,
+            }),
+            "a frame without a reason is unchanged"
+        );
+
+        let with = approval_request_frame("r1", "shell", "ls", 30, Some("hook asked"));
+        assert_eq!(with["reason"], "hook asked");
+        assert_eq!(with["tool"], "shell");
+    }
 
     #[test]
     fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {

@@ -19,6 +19,9 @@ use zeroclaw_config::schema::RiskProfileConfig;
 pub struct ApprovalRequest {
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    /// Why the operator is being asked, when a hook's ask forced the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The user's response to an approval request.
@@ -77,7 +80,7 @@ pub struct ApprovalLogEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HookApproval {
     /// Prompt whatever the risk profile says, ignoring the session's "Always"
-    /// answers, as for an `always_ask` tool.
+    /// answers, as for an `always_ask` tool. The prompt shows the reason.
     Ask(String),
     /// Skip a prompt the risk profile would show, except for an `always_ask`
     /// tool.
@@ -385,6 +388,18 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> io::Result<ApprovalRespo
         crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
     );
     eprintln!("   {summary}");
+    if let Some(reason) = request
+        .reason
+        .as_deref()
+        .map(one_line)
+        .filter(|r| !r.is_empty())
+    {
+        let reason_args = [("reason", reason.as_str())];
+        eprintln!(
+            "   {}",
+            crate::i18n::get_required_cli_string_with_args("channel-approval-reason", &reason_args)
+        );
+    }
     eprint!(
         "{}",
         crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
@@ -400,6 +415,15 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> io::Result<ApprovalRespo
     }
 
     Ok(parse_cli_approval_response(&line))
+}
+
+/// Untrusted text folded onto one line: whitespace and control characters,
+/// terminal escape sequences included, become single spaces.
+fn one_line(text: &str) -> String {
+    text.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_cli_approval_response(line: &str) -> ApprovalResponse {
@@ -624,6 +648,15 @@ mod tests {
             mgr.approval_requirement_with_hook("shell", Some(&approve())),
             ApprovalRequirement::Prompt
         );
+    }
+
+    #[test]
+    fn one_line_strips_line_breaks_and_terminal_escapes() {
+        assert_eq!(
+            one_line("first\nsecond\u{1b}[31m  third\t"),
+            "first second [31m third"
+        );
+        assert_eq!(one_line(" \n "), "");
     }
 
     #[test]
@@ -1247,6 +1280,7 @@ mod tests {
         let req = ApprovalRequest {
             tool_name: "shell".into(),
             arguments: serde_json::json!({"command": "echo hi"}),
+            reason: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
@@ -1386,6 +1420,7 @@ mod tests {
             arguments_summary: "command: ls -la".into(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ChannelApprovalRequest = serde_json::from_str(&json).unwrap();

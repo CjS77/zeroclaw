@@ -65,6 +65,7 @@ pub(crate) async fn gate_tool_approval(
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
+            reason: hook_ask.map(str::to_owned),
         };
 
         // Interactive CLI: prompt the operator.
@@ -93,6 +94,7 @@ pub(crate) async fn gate_tool_approval(
                     arguments_summary,
                     raw_arguments: Some(request.arguments.clone()),
                     position: Some(position),
+                    reason: request.reason.clone(),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
                 // Narration rides the async delta queue to the draft updater,

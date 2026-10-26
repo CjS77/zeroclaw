@@ -150,8 +150,10 @@ check never by itself makes one wait.
 `request-approval` is the deepest integration point. The runtime presents a
 compact `approval-request` (tool name, arguments summary, optional raw JSON
 arguments) and your channel renders it however the platform allows (buttons,
-reactions, a reply convention). The `approval-response` variant you return
-drives the security machinery:
+reactions, a reply convention). An optional `reason` says why the operator is
+being asked. It is untrusted text, so escape it for your platform's markup and
+keep it to one line. The `approval-response` variant you return drives the
+security machinery:
 
 - `approve`: execute this one call
 - `deny`: refuse it

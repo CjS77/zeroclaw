@@ -5165,13 +5165,16 @@ impl SlackChannel {
 /// Socket Mode builds its own Block Kit card rather than going through
 /// [`crate::util::build_yesno_approval_prompt`], so the position line has to be
 /// threaded into both surfaces the operator can read: the `text` notification
-/// fallback and the `mrkdwn` section.
+/// fallback and the `mrkdwn` section. The untrusted reason gets its own
+/// `plain_text` section, which Slack renders without any formatting, and is
+/// entity-escaped in the `text` fallback.
 fn build_socket_mode_approval_body(
     recipient: &str,
     token: &str,
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+    reason: Option<&str>,
 ) -> serde_json::Value {
     let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
@@ -5181,9 +5184,15 @@ fn build_socket_mode_approval_body(
     let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
     // Two pending cards from one turn are otherwise identical until tapped.
     let position_line = crate::util::approval_position_line(position);
-    serde_json::json!({
+    let escaped_reason = reason.map(escape_slack_text);
+    let text_reason = match crate::util::approval_reason_line(escaped_reason.as_deref()).trim_end()
+    {
+        "" => String::new(),
+        line => format!("\n{line}"),
+    };
+    let mut body = serde_json::json!({
         "channel": recipient,
-        "text": format!("{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"),
+        "text": format!("{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}{text_reason}"),
         "blocks": [{
             "type": "section",
             "text": {
@@ -5198,7 +5207,30 @@ fn build_socket_mode_approval_body(
                 { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
             ]
         }]
-    })
+    });
+    let reason_line = crate::util::approval_reason_line(reason);
+    let reason_text = reason_line.trim_end();
+    if !reason_text.is_empty()
+        && let Some(blocks) = body["blocks"].as_array_mut()
+    {
+        blocks.insert(
+            1,
+            serde_json::json!({
+                "type": "section",
+                "text": { "type": "plain_text", "text": reason_text, "emoji": false }
+            }),
+        );
+    }
+    body
+}
+
+/// Escapes the three characters Slack treats as control sequences in message
+/// text, so untrusted text cannot open a link, a user or channel mention, or
+/// a `<!here>` broadcast.
+fn escape_slack_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
@@ -6268,6 +6300,7 @@ impl Channel for SlackChannel {
                 &request.tool_name,
                 &request.arguments_summary,
                 request.position_counter(),
+                request.reason.as_deref(),
             );
             self.http_client()
                 .post("https://slack.com/api/chat.postMessage")
@@ -6278,12 +6311,14 @@ impl Channel for SlackChannel {
                 .map(|_| ())
                 .map_err(anyhow::Error::from)
         } else {
+            let reason = request.reason.as_deref().map(escape_slack_text);
             self.send(&SendMessage::new(
                 crate::util::build_yesno_approval_prompt(
                     &token,
                     &request.tool_name,
                     &request.arguments_summary,
                     request.position_counter(),
+                    reason.as_deref(),
                 ),
                 recipient,
             ))
@@ -10164,6 +10199,7 @@ mod tests {
             "shell",
             "ls -la",
             Some((2, 3)),
+            None,
         );
         let expected = crate::util::approval_position_line(Some((2, 3)));
         assert!(!expected.is_empty(), "helper should render a 2-of-3 line");
@@ -10191,12 +10227,80 @@ mod tests {
             "shell",
             "ls -la",
             Some((1, 1)),
+            None,
         );
         let none =
-            super::build_socket_mode_approval_body("C123", "ab12cd", "shell", "ls -la", None);
+            super::build_socket_mode_approval_body("C123", "ab12cd", "shell", "ls -la", None, None);
         assert_eq!(
             single, none,
             "a one-call batch renders exactly as an unpositioned card"
+        );
+    }
+
+    #[test]
+    fn socket_mode_approval_card_shows_the_reason_as_plain_text() {
+        let reason = "*bold* <!channel> <https://evil.example|click> & more";
+        let body = super::build_socket_mode_approval_body(
+            "C123",
+            "ab12cd",
+            "shell",
+            "ls -la",
+            None,
+            Some(reason),
+        );
+
+        // The Block Kit card carries the reason in its own plain_text
+        // section, between the summary and the buttons, so Slack applies no
+        // formatting to it at all.
+        let blocks = body["blocks"].as_array().expect("blocks is an array");
+        assert_eq!(blocks.len(), 3, "summary, reason, actions; got {blocks:?}");
+        assert_eq!(blocks[1]["type"], "section");
+        assert_eq!(blocks[1]["text"]["type"], "plain_text");
+        assert_eq!(
+            blocks[1]["text"]["text"],
+            crate::util::approval_reason_line(Some(reason)).trim_end()
+        );
+        assert_eq!(blocks[2]["type"], "actions");
+        let summary = blocks[0]["text"]["text"].as_str().expect("summary text");
+        assert!(
+            !summary.contains("evil.example"),
+            "the reason stays out of the mrkdwn section; got {summary}"
+        );
+
+        // The notification fallback is parsed for links and mentions, so the
+        // reason is entity-escaped there.
+        let notification = body["text"].as_str().expect("text is a string");
+        assert!(
+            notification.contains("&lt;!channel&gt; &lt;https://evil.example|click&gt; &amp; more"),
+            "the fallback reason must be escaped; got {notification}"
+        );
+        assert!(
+            !notification.contains("<!channel>") && !notification.contains("<https://"),
+            "no live mention or link in the fallback; got {notification}"
+        );
+    }
+
+    #[test]
+    fn socket_mode_approval_card_without_a_reason_has_no_reason_section() {
+        let blank = super::build_socket_mode_approval_body(
+            "C123",
+            "ab12cd",
+            "shell",
+            "ls -la",
+            None,
+            Some(" \n "),
+        );
+        let none =
+            super::build_socket_mode_approval_body("C123", "ab12cd", "shell", "ls -la", None, None);
+        assert_eq!(blank, none, "a blank reason renders exactly as no reason");
+        assert_eq!(none["blocks"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn escape_slack_text_escapes_control_characters() {
+        assert_eq!(
+            super::escape_slack_text("a & <b> <!here>"),
+            "a &amp; &lt;b&gt; &lt;!here&gt;"
         );
     }
 

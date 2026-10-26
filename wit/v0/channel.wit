@@ -88,6 +88,10 @@ interface channel {
         /// Batch position, when the runtime knows it; `none` on paths that
         /// approve a single call with no batch to count.
         position: option<approval-position>,
+        /// Why the operator is being asked, when whatever forced the prompt
+        /// gave a reason; `none` otherwise. Untrusted free text: escape it
+        /// for the rendering surface.
+        reason: option<string>,
     }
 
     /// The operator's response to a channel-presented approval prompt.

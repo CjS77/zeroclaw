@@ -1029,6 +1029,7 @@ fn to_wit_approval_request(req: &ChannelApprovalRequest) -> WitApprovalRequest {
             index: p.index,
             total: p.total,
         }),
+        reason: req.reason.clone(),
     }
 }
 
@@ -1653,6 +1654,23 @@ mod tests {
         assert_eq!(back.file_name, "photo.jpg");
         assert_eq!(back.data, vec![0xFF_u8, 0xD8, 0xFF]);
         assert_eq!(back.mime_type.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn approval_request_carries_the_reason_to_the_plugin() {
+        let mut request = ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            raw_arguments: None,
+            position: None,
+            reason: Some("hook asked".into()),
+        };
+        assert_eq!(
+            to_wit_approval_request(&request).reason.as_deref(),
+            Some("hook asked")
+        );
+        request.reason = None;
+        assert_eq!(to_wit_approval_request(&request).reason, None);
     }
 
     #[test]
