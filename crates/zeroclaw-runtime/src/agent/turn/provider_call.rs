@@ -748,6 +748,7 @@ mod payload_capture_tests {
         draft_reasoning: StreamReasoningMode,
     ) -> TurnCtx<'a> {
         TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             parent_agent_alias: None,
             observer,
             provider_name: "stub",
@@ -1233,6 +1234,7 @@ mod streaming_fallback_tests {
 
     fn recovery_test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
         TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer,
             provider_name: "test-provider",
             model: "test-model",
@@ -1918,6 +1920,7 @@ mod streaming_fallback_tests {
         let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
@@ -2034,6 +2037,7 @@ mod streaming_fallback_tests {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
@@ -2097,6 +2101,7 @@ mod streaming_fallback_tests {
         let pacing = PacingConfig::default();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
@@ -2241,6 +2246,7 @@ mod streaming_fallback_tests {
                 1,
             );
             let ctx = TurnCtx {
+                ingress: &crate::agent::turn::context::TEST_INGRESS,
                 observer: &observer,
                 provider_name: "test-provider",
                 model: "test-model",
@@ -2461,6 +2467,7 @@ mod streaming_fallback_tests {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
@@ -2574,6 +2581,7 @@ mod streaming_fallback_tests {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
@@ -2653,6 +2661,7 @@ mod streaming_fallback_tests {
             cancel_after_retry.cancel();
         });
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
@@ -2733,6 +2742,7 @@ mod streaming_fallback_tests {
             ..PacingConfig::default()
         };
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
@@ -3524,6 +3534,7 @@ mod streaming_fallback_tests {
         let cost_context = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "router-test",
             model: "test-model",
@@ -3638,6 +3649,7 @@ mod streaming_fallback_tests {
         let cost_context = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "router-test",
             model: "test-model",
@@ -3905,6 +3917,7 @@ mod streaming_fallback_tests {
         let cost_context = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "router-test",
             model: "test-model",
@@ -3990,6 +4003,7 @@ mod streaming_fallback_tests {
         let cost_context = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "router-test",
             model: "test-model",

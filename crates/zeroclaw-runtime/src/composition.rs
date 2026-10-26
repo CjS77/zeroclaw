@@ -874,6 +874,7 @@ mod binding_ratchet_tests {
                 if relative.ends_with("/tests.rs")
                     || relative == "agent/safety_net.rs"
                     || relative == "agent/parity.rs"
+                    || relative == "agent/turn/hook_tests.rs"
                 {
                     continue;
                 }
