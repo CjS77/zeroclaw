@@ -6,11 +6,12 @@ use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 
 use zeroclaw_api::channel::ChannelMessage;
-use zeroclaw_api::hook::ToolCallHookContext;
+use zeroclaw_api::hook::{ToolCallDecision, ToolCallHookContext};
 use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
+use crate::approval::HookApproval;
 
 pub(crate) fn tool_call_hook_context(
     turn_id: &str,
@@ -18,6 +19,53 @@ pub(crate) fn tool_call_hook_context(
     call_index: usize,
 ) -> ToolCallHookContext {
     ToolCallHookContext::new(format!("{turn_id}:{iteration}:{call_index}"))
+}
+
+/// Split a hook's decision into the call it lets through and the approval it
+/// asked for or granted, or the reason it cancelled the call.
+pub(crate) fn split_tool_call_decision(
+    decision: ToolCallDecision,
+) -> Result<(String, Value, Option<HookApproval>), String> {
+    match decision {
+        ToolCallDecision::Continue(name, args) => Ok((name, args, None)),
+        ToolCallDecision::Cancel(reason) => Err(reason),
+        ToolCallDecision::Ask { name, args, reason } => {
+            Ok((name, args, Some(HookApproval::Ask(reason))))
+        }
+        ToolCallDecision::Approve { name, args, reason } => {
+            Ok((name, args, Some(HookApproval::Approve(reason))))
+        }
+        _ => Err("the hook returned a decision this runtime does not support".to_string()),
+    }
+}
+
+/// Fold one hook's approval into the approval the earlier hooks settled on.
+/// An ask is never overridden. An approval covers the call as its hook saw
+/// it, so it lapses when a later hook changes the call without approving it
+/// again.
+fn fold_hook_approval(
+    settled: Option<HookApproval>,
+    next: Option<HookApproval>,
+    call_changed: bool,
+) -> Option<HookApproval> {
+    match (settled, next) {
+        (Some(ask @ HookApproval::Ask(_)), _) | (_, Some(ask @ HookApproval::Ask(_))) => Some(ask),
+        (_, Some(approve)) => Some(approve),
+        (Some(HookApproval::Approve(_)), None) if call_changed => None,
+        (settled, None) => settled,
+    }
+}
+
+fn join_tool_call_decision(
+    name: String,
+    args: Value,
+    approval: Option<HookApproval>,
+) -> ToolCallDecision {
+    match approval {
+        None => ToolCallDecision::Continue(name, args),
+        Some(HookApproval::Ask(reason)) => ToolCallDecision::Ask { name, args, reason },
+        Some(HookApproval::Approve(reason)) => ToolCallDecision::Approve { name, args, reason },
+    }
 }
 
 pub struct HookRunner {
@@ -395,42 +443,68 @@ impl HookRunner {
             .await
     }
 
+    /// Run every hook's before-tool-call phase without an approval gate.
+    ///
+    /// Callers that can put a call in front of an operator use
+    /// [`HookRunner::run_before_tool_call_decision`]. This entry point has no
+    /// operator to ask, so a hook's ask cancels the call, and an approval is
+    /// moot.
     pub async fn run_before_tool_call_with_context(
+        &self,
+        context: &ToolCallHookContext,
+        name: String,
+        args: Value,
+    ) -> HookResult<(String, Value)> {
+        let decision = self
+            .run_before_tool_call_decision(context, name, args)
+            .await;
+        match split_tool_call_decision(decision) {
+            Ok((_, _, Some(HookApproval::Ask(reason)))) | Err(reason) => HookResult::Cancel(reason),
+            Ok((name, args, _)) => HookResult::Continue((name, args)),
+        }
+    }
+
+    /// Run every hook's decision on a tool call, in priority order. Each hook
+    /// sees the call as the hooks before it left it. The first cancel stops
+    /// the chain; otherwise the approvals fold as [`fold_hook_approval`]
+    /// describes. A panicking hook is logged and skipped.
+    pub async fn run_before_tool_call_decision(
         &self,
         context: &ToolCallHookContext,
         mut name: String,
         mut args: Value,
-    ) -> HookResult<(String, Value)> {
+    ) -> ToolCallDecision {
+        let mut approval = None;
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_tool_call_with_context(
-                context,
-                name.clone(),
-                args.clone(),
-            ))
-            .catch_unwind()
-            .await
-            {
-                Ok(HookResult::Continue((n, a))) => {
-                    name = n;
-                    args = a;
+            let decided =
+                AssertUnwindSafe(h.before_tool_call_decision(context, name.clone(), args.clone()))
+                    .catch_unwind()
+                    .await;
+            let Ok(decision) = decided else {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"hook": hook_name})),
+                    "before_tool_call hook panicked; continuing with previous values"
+                );
+                continue;
+            };
+            match split_tool_call_decision(decision) {
+                Ok((next_name, next_args, next_approval)) => {
+                    let call_changed = next_name != name || next_args != args;
+                    approval = fold_hook_approval(approval, next_approval, call_changed);
+                    name = next_name;
+                    args = next_args;
                 }
-                Ok(HookResult::Cancel(reason)) => {
+                Err(reason) => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_tool_call cancelled by hook");
-                    return HookResult::Cancel(reason);
-                }
-                Err(_) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"hook": hook_name})),
-                        "before_tool_call hook panicked; continuing with previous values"
-                    );
+                    return ToolCallDecision::Cancel(reason);
                 }
             }
         }
-        HookResult::Continue((name, args))
+        join_tool_call_decision(name, args, approval)
     }
 
     pub async fn run_on_message_received(
@@ -508,6 +582,131 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// Returns a fixed decision for every call, after setting the call's
+    /// arguments to `args` when given.
+    struct FixedDecision {
+        name: &'static str,
+        priority: i32,
+        args: Option<Value>,
+        decide: fn(String, Value) -> ToolCallDecision,
+    }
+
+    #[async_trait]
+    impl HookHandler for FixedDecision {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+        async fn before_tool_call_decision(
+            &self,
+            _context: &ToolCallHookContext,
+            name: String,
+            args: Value,
+        ) -> ToolCallDecision {
+            (self.decide)(name, self.args.clone().unwrap_or(args))
+        }
+    }
+
+    fn asks(name: String, args: Value) -> ToolCallDecision {
+        ToolCallDecision::Ask {
+            name,
+            args,
+            reason: "ask".into(),
+        }
+    }
+
+    fn approves(name: String, args: Value) -> ToolCallDecision {
+        ToolCallDecision::Approve {
+            name,
+            args,
+            reason: "approve".into(),
+        }
+    }
+
+    fn continues(name: String, args: Value) -> ToolCallDecision {
+        ToolCallDecision::Continue(name, args)
+    }
+
+    async fn decide(hooks: Vec<FixedDecision>) -> ToolCallDecision {
+        let mut runner = HookRunner::new();
+        hooks
+            .into_iter()
+            .for_each(|hook| runner.register(Box::new(hook)));
+        runner
+            .run_before_tool_call_decision(
+                &tool_call_hook_context("turn-a", 0, 0),
+                "send".into(),
+                serde_json::json!({}),
+            )
+            .await
+    }
+
+    fn hook(
+        name: &'static str,
+        priority: i32,
+        decide: fn(String, Value) -> ToolCallDecision,
+    ) -> FixedDecision {
+        FixedDecision {
+            name,
+            priority,
+            args: None,
+            decide,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ask_wins_over_an_approval_in_either_order() {
+        for (first, second) in [
+            (asks as fn(_, _) -> _, approves as fn(_, _) -> _),
+            (approves, asks),
+        ] {
+            let decision = decide(vec![hook("first", 10, first), hook("second", 0, second)]).await;
+            assert!(
+                matches!(decision, ToolCallDecision::Ask { ref reason, .. } if reason == "ask"),
+                "{decision:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_lapses_when_a_later_hook_changes_the_call() {
+        let rewrite = FixedDecision {
+            args: Some(serde_json::json!({"to": "someone else"})),
+            ..hook("rewrite", 0, continues)
+        };
+        let decision = decide(vec![hook("approve", 10, approves), rewrite]).await;
+        assert_eq!(
+            decision,
+            ToolCallDecision::Continue("send".into(), serde_json::json!({"to": "someone else"}))
+        );
+
+        let decision = decide(vec![
+            hook("approve", 10, approves),
+            hook("pass", 0, continues),
+        ])
+        .await;
+        assert!(
+            matches!(decision, ToolCallDecision::Approve { .. }),
+            "{decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_context_entry_point_cancels_an_ask_it_cannot_put_to_an_operator() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(hook("ask", 0, asks)));
+        let result = runner
+            .run_before_tool_call_with_context(
+                &tool_call_hook_context("turn-a", 0, 0),
+                "send".into(),
+                serde_json::json!({}),
+            )
+            .await;
+        assert!(matches!(result, HookResult::Cancel(ref reason) if reason == "ask"));
+    }
 
     /// A hook that records how many times void events fire.
     struct CountingHook {

@@ -138,6 +138,54 @@ impl<T> HookResult<T> {
     }
 }
 
+/// What a before-tool-call hook decides about one call.
+///
+/// `Continue` and `Cancel` mean what they mean for [`HookResult`]. `Ask` and
+/// `Approve` also let the call run, possibly with a changed name or
+/// arguments, but take over the risk profile's decision on whether an
+/// operator must approve it first. A runtime that meets a variant it does not
+/// know cancels the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolCallDecision {
+    /// Run the call. The risk profile decides whether to prompt.
+    Continue(String, Value),
+    /// Don't run the call. The reason becomes the call's result.
+    Cancel(String),
+    /// Run the call only if an operator approves it now: prompt whatever the
+    /// risk profile says, and ignore the session's "Always" answers for this
+    /// call, as for a tool the profile lists in `always_ask`; read-only mode
+    /// still blocks the call if the operator approves it. When no operator can
+    /// be asked, as in a scheduled turn, the call is not run, and the reason is
+    /// in its result. An operator's "Always" answer still adds the tool to the
+    /// session's list, so later calls the hook does not ask about skip the
+    /// prompt.
+    Ask {
+        name: String,
+        args: Value,
+        reason: String,
+    },
+    /// Run the call without the prompt the risk profile would show, as if the
+    /// operator had approved it. For a command tool such as `shell` that
+    /// includes the command-level approval that lets it run higher-risk
+    /// commands. Grants nothing where the profile would not prompt, and a tool
+    /// the profile lists in `always_ask` is still prompted for.
+    Approve {
+        name: String,
+        args: Value,
+        reason: String,
+    },
+}
+
+impl From<HookResult<(String, Value)>> for ToolCallDecision {
+    fn from(result: HookResult<(String, Value)>) -> Self {
+        match result {
+            HookResult::Continue((name, args)) => Self::Continue(name, args),
+            HookResult::Cancel(reason) => Self::Cancel(reason),
+        }
+    }
+}
+
 /// Trait for hook handlers. All methods have default no-op implementations.
 /// Implement only the events you care about.
 #[async_trait]
@@ -246,6 +294,29 @@ pub trait HookHandler: Send + Sync {
         self.before_tool_call(name, args).await
     }
 
+    /// Decide on a tool call before it runs: continue, cancel, or take over
+    /// whether an operator must approve it (see [`ToolCallDecision`]).
+    ///
+    /// The default delegates to
+    /// [`HookHandler::before_tool_call_with_context`], so a hook that only
+    /// continues or cancels needs nothing new. When several hooks decide on
+    /// the same call, an `Ask` from any of them wins over an `Approve`, and an
+    /// `Approve` lapses if a later hook changes the call's name or arguments.
+    ///
+    /// Only turns that carry hooks run this: a delegated sub-agent's turn runs
+    /// without them. A hook that panics is skipped, as for the other before
+    /// hooks, and the call goes ahead on the other hooks' decisions.
+    async fn before_tool_call_decision(
+        &self,
+        context: &ToolCallHookContext,
+        name: String,
+        args: Value,
+    ) -> ToolCallDecision {
+        self.before_tool_call_with_context(context, name, args)
+            .await
+            .into()
+    }
+
     async fn on_message_received(&self, message: ChannelMessage) -> HookResult<ChannelMessage> {
         HookResult::Continue(message)
     }
@@ -313,6 +384,39 @@ mod tests {
         assert_eq!(stamped, bare, "the turn is not part of the identity");
         assert_eq!(stamped.invocation_id(), "turn-1:0:0");
         assert!(stamped.is_correlated());
+    }
+
+    #[tokio::test]
+    async fn default_decision_follows_the_context_hook() {
+        struct Cancelling;
+        #[async_trait]
+        impl HookHandler for Cancelling {
+            fn name(&self) -> &str {
+                "cancelling"
+            }
+            async fn before_tool_call_with_context(
+                &self,
+                _context: &ToolCallHookContext,
+                _name: String,
+                _args: Value,
+            ) -> HookResult<(String, Value)> {
+                HookResult::Cancel("no".into())
+            }
+        }
+        let context = ToolCallHookContext::new("turn-1:0:0");
+        let args = serde_json::json!({"cmd": "ls"});
+        assert_eq!(
+            TestHook::new("pass", 0)
+                .before_tool_call_decision(&context, "shell".into(), args.clone())
+                .await,
+            ToolCallDecision::Continue("shell".into(), args.clone())
+        );
+        assert_eq!(
+            Cancelling
+                .before_tool_call_decision(&context, "shell".into(), args)
+                .await,
+            ToolCallDecision::Cancel("no".into())
+        );
     }
 
     #[test]
