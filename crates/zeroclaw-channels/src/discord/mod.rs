@@ -871,11 +871,14 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
+        // Discord renders markdown in message content; the reason is untrusted.
+        let reason = request.reason.as_deref().map(crate::util::escape_markdown);
         let text = crate::util::build_yesno_approval_prompt(
             token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            reason.as_deref(),
         );
         self.send(&SendMessage::new(text, channel_id)).await
     }
@@ -909,6 +912,7 @@ impl DiscordChannel {
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            request.reason.as_deref(),
         );
         let outgoing = DiscordOutgoing::with_components(text, vec![row]);
         let client = self.http_client();
@@ -941,14 +945,23 @@ fn build_buttoned_approval_text(
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+    reason: Option<&str>,
 ) -> String {
     let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = i18n::get_required_cli_string("channel-approval-args-label");
     // Two pending cards from one turn are otherwise identical until tapped.
     let position_line = crate::util::approval_position_line(position);
+    // Discord renders markdown in message content; the reason is untrusted.
+    // The card has no trailing line, so the reason goes on after the args.
+    let escaped_reason = reason.map(crate::util::escape_markdown);
+    let reason_suffix =
+        match crate::util::approval_reason_line(escaped_reason.as_deref()).trim_end() {
+            "" => String::new(),
+            line => format!("\n{line}"),
+        };
     format!(
-        "{heading}\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"
+        "{heading}\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}{reason_suffix}"
     )
 }
 
@@ -8236,7 +8249,7 @@ mod tests {
         // The buttoned card is a real approval front door: without this line,
         // two cards from one turn are indistinguishable before either is
         // tapped, which is the whole failure being fixed.
-        let text = super::build_buttoned_approval_text("shell", "ls -la", Some((2, 3)));
+        let text = super::build_buttoned_approval_text("shell", "ls -la", Some((2, 3)), None);
         assert!(
             text.contains("2") && text.contains("3"),
             "buttoned card should carry the batch position; got {text}"
@@ -8259,11 +8272,57 @@ mod tests {
 
     #[test]
     fn buttoned_approval_card_omits_the_position_for_a_single_call() {
-        let single = super::build_buttoned_approval_text("shell", "ls -la", Some((1, 1)));
-        let none = super::build_buttoned_approval_text("shell", "ls -la", None);
+        let single = super::build_buttoned_approval_text("shell", "ls -la", Some((1, 1)), None);
+        let none = super::build_buttoned_approval_text("shell", "ls -la", None, None);
         assert_eq!(
             single, none,
             "a one-call batch renders exactly as an unpositioned card"
+        );
+    }
+
+    #[test]
+    fn buttoned_approval_card_shows_the_reason_after_the_args() {
+        let text =
+            super::build_buttoned_approval_text("shell", "ls -la", None, Some("policy asks"));
+        let reason_line = crate::util::approval_reason_line(Some("policy asks"));
+        assert!(
+            !reason_line.is_empty(),
+            "helper should render a reason line"
+        );
+        assert!(
+            text.ends_with(&format!("ls -la\n{}", reason_line.trim_end())),
+            "the reason follows the args line; got {text}"
+        );
+    }
+
+    #[test]
+    fn buttoned_approval_card_escapes_markdown_in_the_reason() {
+        let text = super::build_buttoned_approval_text(
+            "shell",
+            "ls -la",
+            None,
+            Some("**urgent** [click](https://evil.example) @everyone"),
+        );
+        assert!(
+            !text.contains("**urgent**")
+                && !text.contains("[click](")
+                && !text.contains(" @everyone"),
+            "markdown in the reason must not survive unescaped; got {text}"
+        );
+        assert!(
+            text.contains(r"\*\*urgent\*\* \[click\]\(https\:\/\/evil\.example\) \@everyone"),
+            "the reason is shown literally, escaped; got {text}"
+        );
+    }
+
+    #[test]
+    fn buttoned_approval_card_without_a_reason_is_unchanged() {
+        let blank = super::build_buttoned_approval_text("shell", "ls -la", None, Some("  "));
+        let none = super::build_buttoned_approval_text("shell", "ls -la", None, None);
+        assert_eq!(blank, none, "a blank reason renders exactly as no reason");
+        assert!(
+            none.ends_with("ls -la"),
+            "no trailing reason line; got {none}"
         );
     }
 

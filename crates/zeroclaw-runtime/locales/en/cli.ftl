@@ -1622,6 +1622,7 @@ channel-approval-btn-deny = Deny
 channel-approval-btn-always = Always
 channel-approval-tap-instruction = Tap a button below:
 channel-approval-position = Tool call { $index } of { $total }
+channel-approval-reason = Reason: { $reason }
 channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
 channel-approval-group-visibility-warning =

@@ -458,11 +458,23 @@ impl Channel for AcpChannel {
         );
         let kind = map_approval_kind(&request.tool_name);
         let raw_input = build_approval_raw_input(&request.tool_name, &request.raw_arguments);
-        let content = build_approval_content(
+        let mut content = build_approval_content(
             &request.tool_name,
             &request.raw_arguments,
             &request.arguments_summary,
         );
+        // The reason trails the tool's own content as a text block, so a
+        // diff view keeps its first slot.
+        let reason_line = crate::util::approval_reason_line(request.reason.as_deref());
+        let reason_text = reason_line.trim_end();
+        if !reason_text.is_empty()
+            && let Some(blocks) = content.as_array_mut()
+        {
+            blocks.push(json!({
+                "type": "content",
+                "content": { "type": "text", "text": reason_text },
+            }));
+        }
 
         // For edit tools, also surface the new_string (or content) directly so that
         // "reject-with-edit" can present exactly the proposed replacement for editing,
@@ -1000,6 +1012,7 @@ mod tests {
             arguments_summary: "git status --short".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -1037,6 +1050,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_approval_appends_the_reason_after_the_tool_content() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "make deploy".to_string(),
+            raw_arguments: None,
+            position: None,
+            reason: Some("deploys to a shared host".to_string()),
+        };
+
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let content = req["params"]["toolCall"]["content"].as_array().unwrap();
+        assert_eq!(
+            content.len(),
+            2,
+            "tool content, then the reason; got {content:?}"
+        );
+        assert_eq!(content[0]["content"]["text"], "make deploy");
+        assert_eq!(content[1]["type"], "content");
+        assert_eq!(
+            content[1]["content"]["text"],
+            crate::util::approval_reason_line(Some("deploys to a shared host")).trim_end()
+        );
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(json!({"outcome": {"outcome": "selected", "optionId": "reject-once"}})),
+            None,
+        );
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, Some(ChannelApprovalResponse::Deny));
+    }
+
+    #[tokio::test]
     async fn request_approval_maps_always_and_cancel() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
@@ -1052,6 +1111,7 @@ mod tests {
             arguments_summary: "git commit".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -1083,6 +1143,7 @@ mod tests {
             arguments_summary: "git push".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
         let line = rx.recv().await.unwrap();
@@ -1119,6 +1180,7 @@ mod tests {
                 "new_string": "let x = 2;"
             })),
             position: None,
+            reason: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -1195,6 +1257,7 @@ mod tests {
                 "new_string": "let x = 2;"
             })),
             position: None,
+            reason: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -1244,6 +1307,7 @@ mod tests {
                 "new_string": "b"
             })),
             position: None,
+            reason: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -1283,6 +1347,7 @@ mod tests {
             arguments_summary: "edit foo.rs".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -1326,6 +1391,7 @@ mod tests {
             arguments_summary: "write bar.rs".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });

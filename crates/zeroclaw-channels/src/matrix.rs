@@ -241,7 +241,7 @@ mod allowlist {
 // ─── approval ──────────────────────────────────────────────────────────────
 mod approval {
     use rand::{Rng, RngExt};
-    use zeroclaw_api::channel::{ChannelApprovalResponse, SendMessage};
+    use zeroclaw_api::channel::{ChannelApprovalRequest, ChannelApprovalResponse, SendMessage};
 
     pub(super) const TOKEN_LEN: usize = 8;
     const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -263,6 +263,20 @@ mod approval {
     /// (recipient, voice suppression) without standing up a live client.
     pub(super) fn build_prompt_message(prompt: String, recipient: &str) -> SendMessage {
         SendMessage::new(prompt, recipient).suppress_voice()
+    }
+
+    /// Prompt text for `request` under `token`. Matrix sends it as markdown,
+    /// which passes inline HTML through, so the untrusted reason is escaped
+    /// before it reaches the shared builder.
+    pub(super) fn build_prompt_text(token: &str, request: &ChannelApprovalRequest) -> String {
+        let reason = request.reason.as_deref().map(crate::util::escape_markdown);
+        crate::util::build_approve_deny_approval_prompt(
+            token,
+            &request.tool_name,
+            &request.arguments_summary,
+            request.position_counter(),
+            reason.as_deref(),
+        )
     }
 
     /// Try to parse an approval reply. Returns `Some((token, response))` if the
@@ -5475,12 +5489,7 @@ impl Channel for MatrixChannel {
             .await?
             .to_string();
         let token = approval::generate_token_default();
-        let prompt = crate::util::build_approve_deny_approval_prompt(
-            &token,
-            &request.tool_name,
-            &request.arguments_summary,
-            request.position_counter(),
-        );
+        let prompt = approval::build_prompt_text(&token, request);
 
         let (tx, rx) = oneshot::channel();
         self.pending_approvals.lock().await.insert(
@@ -7892,7 +7901,8 @@ mod tests {
 
     mod approval {
         use super::super::approval::{
-            TOKEN_LEN, build_prompt_message, generate_token, generate_token_default, parse_reply,
+            TOKEN_LEN, build_prompt_message, build_prompt_text, generate_token,
+            generate_token_default, parse_reply,
         };
         use rand::SeedableRng;
         use rand::rngs::StdRng;
@@ -8073,6 +8083,7 @@ mod tests {
                 "shell",
                 "ls -la",
                 None,
+                None,
             );
 
             let message = build_prompt_message(prompt.clone(), "!room:example.invalid");
@@ -8087,14 +8098,57 @@ mod tests {
         }
 
         #[test]
+        fn approval_prompt_escapes_markup_in_the_reason() {
+            // Matrix renders the prompt as markdown, and markdown passes
+            // inline HTML through to `formatted_body`.
+            let request = zeroclaw_api::channel::ChannelApprovalRequest {
+                tool_name: "shell".to_string(),
+                arguments_summary: "ls -la".to_string(),
+                raw_arguments: None,
+                position: None,
+                reason: Some("<b>urgent</b> [docs](https://evil.example)".to_string()),
+            };
+            let prompt = build_prompt_text("ABCDEFGH", &request);
+            assert!(
+                !prompt.contains("<b>") && !prompt.contains("[docs]("),
+                "markup in the reason must not survive unescaped; got {prompt:?}"
+            );
+            let expected = crate::util::approval_reason_line(Some(
+                r"\<b\>urgent\<\/b\> \[docs\]\(https\:\/\/evil\.example\)",
+            ));
+            assert!(
+                prompt.contains(expected.as_str()),
+                "the escaped reason line follows the args; want {expected:?}, got {prompt:?}"
+            );
+        }
+
+        #[test]
+        fn approval_prompt_without_a_reason_matches_the_shared_builder() {
+            let request = zeroclaw_api::channel::ChannelApprovalRequest {
+                tool_name: "shell".to_string(),
+                arguments_summary: "ls -la".to_string(),
+                raw_arguments: None,
+                position: None,
+                reason: None,
+            };
+            assert_eq!(
+                build_prompt_text("ABCDEFGH", &request),
+                crate::util::build_approve_deny_approval_prompt(
+                    "ABCDEFGH", "shell", "ls -la", None, None
+                )
+            );
+        }
+
+        #[test]
         fn localized_request_approval_prompt_still_parses_via_matrix_own_parser() {
             // Localization must not desync the (possibly translated) prompt
             // prose from Matrix's own approve/deny/always parser: the
             // keywords the prompt shows must remain the literal ASCII words
             // `parse_reply` expects, whatever locale is active.
             let token = generate_token_default();
-            let prompt =
-                crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la", None);
+            let prompt = crate::util::build_approve_deny_approval_prompt(
+                &token, "shell", "ls -la", None, None,
+            );
             assert!(
                 prompt.contains(&token),
                 "prompt should echo the token verbatim; got {prompt:?}"

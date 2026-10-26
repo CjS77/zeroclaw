@@ -252,6 +252,7 @@ fn build_approval_card(
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+    reason: Option<&str>,
 ) -> serde_json::Value {
     // Two pending cards from one turn are otherwise identical until tapped.
     // The shared line is newline-terminated; Lark's markdown needs the blank
@@ -275,7 +276,7 @@ fn build_approval_card(
         })
     };
 
-    serde_json::json!({
+    let mut card = serde_json::json!({
         "schema": "2.0",
         "config": { "wide_screen_mode": true },
         "header": {
@@ -308,7 +309,23 @@ fn build_approval_card(
                 }
             ]
         }
-    })
+    });
+    // The reason is untrusted text, so it gets a plain_text element of its
+    // own, after the tool and args, rather than a line in the markdown.
+    let reason_line = crate::util::approval_reason_line(reason);
+    let reason_text = reason_line.trim_end();
+    if !reason_text.is_empty()
+        && let Some(elements) = card["body"]["elements"].as_array_mut()
+    {
+        elements.insert(
+            1,
+            serde_json::json!({
+                "tag": "div",
+                "text": { "tag": "plain_text", "content": reason_text }
+            }),
+        );
+    }
+    card
 }
 
 fn build_resolved_approval_card(
@@ -3184,6 +3201,7 @@ impl Channel for LarkChannel {
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            request.reason.as_deref(),
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_approvals.lock().await.insert(
@@ -6199,7 +6217,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_contains_all_three_buttons() {
-        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", None);
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", None, None);
 
         // Card 2.0 schema lock — guard against future regressions where the
         // send-side schema drifts back to 1.0 (which Feishu's PATCH endpoint
@@ -6232,7 +6250,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_round_trips_approval_id_in_all_buttons() {
-        let card = build_approval_card("approval-abc-123", "tool", "args", None);
+        let card = build_approval_card("approval-abc-123", "tool", "args", None, None);
         let columns = card["body"]["elements"][1]["columns"]
             .as_array()
             .expect("columns array");
@@ -6246,7 +6264,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_shows_the_batch_position() {
-        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", Some((2, 3)));
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", Some((2, 3)), None);
         let content = card["body"]["elements"][0]["content"]
             .as_str()
             .expect("markdown content");
@@ -6260,8 +6278,8 @@ mod tests {
 
     #[test]
     fn build_approval_card_omits_the_position_for_a_single_call() {
-        let single = build_approval_card("test-id", "shell", "args", Some((1, 1)));
-        let none = build_approval_card("test-id", "shell", "args", None);
+        let single = build_approval_card("test-id", "shell", "args", Some((1, 1)), None);
+        let none = build_approval_card("test-id", "shell", "args", None, None);
         assert_eq!(
             single, none,
             "a one-call batch renders exactly as an unpositioned card"
@@ -6269,10 +6287,46 @@ mod tests {
     }
 
     #[test]
+    fn build_approval_card_shows_the_reason_as_plain_text() {
+        let reason = "**urgent** <at id=all></at> [docs](https://evil.example)";
+        let card = build_approval_card("test-id", "shell", "args", None, Some(reason));
+        let elements = card["body"]["elements"].as_array().expect("elements array");
+        assert_eq!(
+            elements.len(),
+            3,
+            "markdown, reason, buttons; got {elements:?}"
+        );
+
+        // Its own plain_text element: Lark applies no markdown, mention, or
+        // link rendering to it.
+        assert_eq!(elements[1]["tag"], "div");
+        assert_eq!(elements[1]["text"]["tag"], "plain_text");
+        assert_eq!(
+            elements[1]["text"]["content"],
+            crate::util::approval_reason_line(Some(reason)).trim_end()
+        );
+        assert_eq!(elements[2]["tag"], "column_set", "buttons stay last");
+
+        let markdown = elements[0]["content"].as_str().expect("markdown content");
+        assert!(
+            !markdown.contains("evil.example"),
+            "the reason stays out of the markdown element; got {markdown}"
+        );
+    }
+
+    #[test]
+    fn build_approval_card_without_a_reason_has_no_reason_element() {
+        let blank = build_approval_card("test-id", "shell", "args", None, Some("\t "));
+        let none = build_approval_card("test-id", "shell", "args", None, None);
+        assert_eq!(blank, none, "a blank reason renders exactly as no reason");
+        assert_eq!(none["body"]["elements"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
     fn build_approval_card_and_resolved_card_share_schema_version() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        let send_card = build_approval_card("id", "shell", "args", None);
+        let send_card = build_approval_card("id", "shell", "args", None, None);
         let patch_card =
             build_resolved_approval_card("shell", "args", ChannelApprovalResponse::Approve);
 
@@ -7061,6 +7115,7 @@ mod tests {
                         arguments_summary: "demo args".to_string(),
                         raw_arguments: None,
                         position: None,
+                        reason: None,
                     },
                 )
                 .await

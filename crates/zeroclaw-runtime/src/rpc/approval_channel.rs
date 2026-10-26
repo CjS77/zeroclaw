@@ -179,19 +179,19 @@ impl RpcApprovalChannel {
             self.pending
                 .register(request_id.clone(), self.session_id.clone(), tx);
 
-        self.rpc
-            .notify(
-                "session/update",
-                json!({
-                    "type": "approval_request",
-                    "session_id": self.session_id,
-                    "request_id": request_id,
-                    "tool_name": request.tool_name,
-                    "arguments_summary": request.arguments_summary,
-                    "timeout_secs": timeout.as_secs(),
-                }),
-            )
-            .await;
+        let mut update = json!({
+            "type": "approval_request",
+            "session_id": self.session_id,
+            "request_id": request_id,
+            "tool_name": request.tool_name,
+            "arguments_summary": request.arguments_summary,
+            "timeout_secs": timeout.as_secs(),
+        });
+        // Omitted when absent, as in `SessionUpdateEvent::ApprovalRequest`.
+        if let Some(reason) = &request.reason {
+            update["reason"] = json!(reason);
+        }
+        self.rpc.notify("session/update", update).await;
 
         // Only the answered arm is an operator decision. The other two deny
         // because the client went away or never answered, and say so.
@@ -354,6 +354,7 @@ mod tests {
             arguments_summary: "ls /tmp".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         let pending_for_resolve = Arc::clone(&pending);
@@ -365,12 +366,43 @@ mod tests {
         assert_eq!(v["params"]["type"], "approval_request");
         assert_eq!(v["params"]["session_id"], "sess-1");
         assert_eq!(v["params"]["tool_name"], "shell");
+        assert!(
+            v["params"].get("reason").is_none(),
+            "no reason, no field; got {v}"
+        );
 
         let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
         pending_for_resolve.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve);
 
         let result = task.await.unwrap().unwrap();
         assert_eq!(result, Some(ChannelApprovalResponse::Approve));
+    }
+
+    #[tokio::test]
+    async fn approval_request_notification_carries_the_reason() {
+        let (rpc, mut write_rx) = make_rpc();
+        let pending = make_pending();
+        let ch = make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending));
+
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls /tmp".to_string(),
+            raw_arguments: None,
+            position: None,
+            reason: Some("reads outside the workspace".to_string()),
+        };
+
+        let pending_for_resolve = Arc::clone(&pending);
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
+
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["params"]["reason"], "reads outside the workspace");
+
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+        pending_for_resolve.resolve(&request_id, "sess-1", ChannelApprovalResponse::Deny);
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, Some(ChannelApprovalResponse::Deny));
     }
 
     #[tokio::test]
@@ -383,6 +415,7 @@ mod tests {
             arguments_summary: "rm -rf /".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_approval_with_timeout("", &request, std::time::Duration::from_millis(50))
@@ -416,6 +449,7 @@ mod tests {
             arguments_summary: "sleep 60".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))

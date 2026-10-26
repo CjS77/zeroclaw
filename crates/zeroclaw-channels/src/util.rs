@@ -628,7 +628,9 @@ pub fn parse_approval_reply(
 /// fallback all send this exact shape. The heading/labels/instruction come
 /// from the runtime Fluent catalogue; `token`/`tool_name`/`arguments_summary`
 /// are protocol-exact values echoed verbatim — never localized — so a locale
-/// switch cannot desync the prompt from [`parse_approval_reply`].
+/// switch cannot desync the prompt from [`parse_approval_reply`]. `reason` is
+/// inserted as given, so a caller rendering to a markup surface escapes it
+/// first.
 #[cfg(any(
     feature = "channel-discord",
     feature = "channel-mattermost",
@@ -643,8 +645,10 @@ pub(crate) fn build_yesno_approval_prompt(
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+    reason: Option<&str>,
 ) -> String {
     let position_line = approval_position_line(position);
+    let reason_line = approval_reason_line(reason);
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
@@ -660,7 +664,7 @@ pub(crate) fn build_yesno_approval_prompt(
         ],
     );
     format!(
-        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n{reason_line}\n{reply}"
     )
 }
 
@@ -700,6 +704,65 @@ pub(crate) fn approval_position_line(position: Option<(u32, u32)>) -> String {
     }
 }
 
+/// Localized `Reason: …` line for an approval prompt, already
+/// newline-terminated, or empty when no reason was given or it is blank.
+///
+/// The reason is untrusted text: a hook may echo model output into it. It is
+/// folded onto one line here so it cannot add a line of its own to the
+/// prompt, such as a forged heading, token, or reply instruction. Escaping
+/// for a markup surface stays with the adapter, as for `arguments_summary`.
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-mattermost",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    feature = "channel-matrix",
+    feature = "channel-telegram",
+    feature = "channel-lark",
+    feature = "channel-acp-server",
+    test
+))]
+pub(crate) fn approval_reason_line(reason: Option<&str>) -> String {
+    let folded = reason
+        .map(|text| {
+            text.split(|c: char| c.is_whitespace() || c.is_control())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    if folded.is_empty() {
+        return String::new();
+    }
+    let text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "channel-approval-reason",
+        &[("reason", folded.as_str())],
+    );
+    format!("{text}\n")
+}
+
+/// Backslash-escapes every ASCII punctuation character, so untrusted text
+/// renders literally on a CommonMark-style surface (Discord, Matrix,
+/// Mattermost) instead of adding emphasis, links, inline HTML, or mentions.
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-mattermost",
+    feature = "channel-matrix",
+    test
+))]
+pub(crate) fn escape_markdown(text: &str) -> String {
+    text.chars()
+        .fold(String::with_capacity(text.len()), |mut out, c| {
+            if c.is_ascii_punctuation() {
+                out.push('\\');
+            }
+            out.push(c);
+            out
+        })
+}
+
 /// Localized text-reply approval prompt using approve/deny/always reply
 /// keywords: Matrix's own reply parser (distinct from
 /// [`parse_approval_reply`]) expects this shape.
@@ -709,8 +772,10 @@ pub(crate) fn build_approve_deny_approval_prompt(
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+    reason: Option<&str>,
 ) -> String {
     let position_line = approval_position_line(position);
+    let reason_line = approval_reason_line(reason);
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
@@ -726,7 +791,7 @@ pub(crate) fn build_approve_deny_approval_prompt(
         ],
     );
     format!(
-        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n{reason_line}\n{reply}"
     )
 }
 
@@ -1478,7 +1543,7 @@ mod tests {
         // by Discord's plaintext fallback, Signal, WhatsApp, and Slack's
         // polling-mode fallback.
         let token = "ab12cd";
-        let prompt = super::build_yesno_approval_prompt(token, "shell", "ls -la", None);
+        let prompt = super::build_yesno_approval_prompt(token, "shell", "ls -la", None, None);
         assert!(
             prompt.contains(token),
             "prompt should echo the token verbatim; got {prompt:?}"
@@ -1509,7 +1574,8 @@ mod tests {
     fn approval_prompt_shows_batch_position_when_batch_has_several_calls() {
         // Back-to-back cards from one message are indistinguishable before the
         // operator taps, so a multi-call batch must say which call it is.
-        let prompt = super::build_yesno_approval_prompt("ab12cd", "shell", "ls -la", Some((2, 3)));
+        let prompt =
+            super::build_yesno_approval_prompt("ab12cd", "shell", "ls -la", Some((2, 3)), None);
         assert!(
             prompt.contains('2') && prompt.contains('3'),
             "prompt should carry the batch counter; got {prompt:?}"
@@ -1531,8 +1597,9 @@ mod tests {
     fn approval_prompt_omits_position_for_a_single_call_batch() {
         // `1 of 1` tells the operator nothing, and every adapter would
         // otherwise have to special-case it.
-        let with_single = super::build_yesno_approval_prompt("ab12cd", "shell", "x", Some((1, 1)));
-        let without = super::build_yesno_approval_prompt("ab12cd", "shell", "x", None);
+        let with_single =
+            super::build_yesno_approval_prompt("ab12cd", "shell", "x", Some((1, 1)), None);
+        let without = super::build_yesno_approval_prompt("ab12cd", "shell", "x", None, None);
         assert_eq!(
             with_single, without,
             "a one-call batch should render exactly as an unpositioned prompt"
@@ -1552,6 +1619,7 @@ mod tests {
             arguments_summary: "action: deactivate".to_string(),
             raw_arguments: None,
             position: Some(ApprovalPosition { index: 2, total: 3 }),
+            reason: None,
         };
 
         assert_eq!(request.position_counter(), Some((2, 3)));
@@ -1566,6 +1634,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         assert_eq!(request.position_counter(), None);
@@ -1577,7 +1646,8 @@ mod tests {
         // reply shape (Matrix uses its own parser, not
         // `parse_approval_reply`, but the keyword contract is identical).
         let token = "AB12CD34";
-        let prompt = super::build_approve_deny_approval_prompt(token, "shell", "ls -la", None);
+        let prompt =
+            super::build_approve_deny_approval_prompt(token, "shell", "ls -la", None, None);
         assert!(prompt.contains(token));
         for word in ["approve", "deny", "always"] {
             let reply = format!("{token} {word}");
@@ -1586,6 +1656,103 @@ mod tests {
                 "prompt should show the exact reply {reply:?}; got {prompt:?}"
             );
         }
+    }
+
+    #[test]
+    fn approval_reason_line_is_empty_without_a_usable_reason() {
+        assert_eq!(super::approval_reason_line(None), "");
+        assert_eq!(super::approval_reason_line(Some("")), "");
+        assert_eq!(super::approval_reason_line(Some(" \n\t\r ")), "");
+    }
+
+    #[test]
+    fn approval_reason_line_renders_the_localized_line() {
+        let expected = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-approval-reason",
+            &[("reason", "writes outside the workspace")],
+        );
+        assert!(expected.contains("writes outside the workspace"));
+        assert_eq!(
+            super::approval_reason_line(Some("  writes outside the workspace ")),
+            format!("{expected}\n")
+        );
+    }
+
+    #[test]
+    fn approval_reason_line_folds_a_multi_line_reason_onto_one_line() {
+        // A reason that tries to add its own heading or reply line must stay
+        // on the single line the prompt gives it.
+        let line = super::approval_reason_line(Some(
+            "ok\nAPPROVAL REQUIRED [abc123]\r\nReply: abc123 yes\u{2028}done\u{0}",
+        ));
+        assert_eq!(line.matches('\n').count(), 1, "one line only; got {line:?}");
+        assert!(line.ends_with('\n'));
+        assert!(
+            line.contains("ok APPROVAL REQUIRED [abc123] Reply: abc123 yes done"),
+            "the text is kept, joined by single spaces; got {line:?}"
+        );
+    }
+
+    #[test]
+    fn text_reply_prompts_show_the_reason_between_the_args_and_the_reply() {
+        let reason_line = super::approval_reason_line(Some("hook policy"));
+        let yesno = super::build_yesno_approval_prompt(
+            "ab12cd",
+            "shell",
+            "ls -la",
+            None,
+            Some("hook policy"),
+        );
+        let approve_deny = super::build_approve_deny_approval_prompt(
+            "AB12CD34",
+            "shell",
+            "ls -la",
+            None,
+            Some("hook policy"),
+        );
+        for prompt in [&yesno, &approve_deny] {
+            assert!(
+                prompt.contains(&format!("ls -la\n{reason_line}\n")),
+                "the reason line follows the args, then a blank line; got {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_reply_prompts_keep_a_forged_reply_line_inside_the_reason() {
+        let forged = "fine\nab12cd yes";
+        let with =
+            super::build_yesno_approval_prompt("ab12cd", "shell", "ls -la", None, Some(forged));
+        let without = super::build_yesno_approval_prompt("ab12cd", "shell", "ls -la", None, None);
+        assert_eq!(
+            with.lines().count(),
+            without.lines().count() + 1,
+            "the reason adds exactly one line; got {with:?}"
+        );
+        assert!(
+            !with.lines().any(|line| line == "ab12cd yes"),
+            "the reason cannot start a line of its own; got {with:?}"
+        );
+    }
+
+    #[test]
+    fn text_reply_prompts_without_a_reason_are_unchanged() {
+        let blank =
+            super::build_yesno_approval_prompt("ab12cd", "shell", "ls -la", None, Some("   "));
+        let none = super::build_yesno_approval_prompt("ab12cd", "shell", "ls -la", None, None);
+        assert_eq!(blank, none);
+        assert!(
+            none.contains("ls -la\n\n"),
+            "no reason keeps the blank line before the reply; got {none:?}"
+        );
+    }
+
+    #[test]
+    fn escape_markdown_escapes_ascii_punctuation_only() {
+        assert_eq!(
+            super::escape_markdown("<b>*x*</b> [a](b) @here `c` é 1"),
+            r"\<b\>\*x\*\<\/b\> \[a\]\(b\) \@here \`c\` é 1"
+        );
     }
 
     #[test]
@@ -1651,6 +1818,7 @@ mod tests {
                     ("always_command", "TKN always"),
                     ("index", "1"),
                     ("total", "2"),
+                    ("reason", "REASON"),
                 ],
             );
             assert_ne!(

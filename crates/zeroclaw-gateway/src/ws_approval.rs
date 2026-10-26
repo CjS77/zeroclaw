@@ -118,6 +118,7 @@ impl Channel for WsApprovalChannel {
             tool_name: request.tool_name.clone(),
             arguments_summary: request.arguments_summary.clone(),
             timeout_secs: self.timeout.as_secs(),
+            reason: request.reason.clone(),
         };
         if self.event_tx.send(event).await.is_err() {
             // Forward task has gone away; the WS is closing. Clean up the
@@ -178,6 +179,29 @@ mod tests {
             arguments_summary: "path=a.txt".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_event_carries_the_reason() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, pending, Duration::from_millis(50));
+        let request = ChannelApprovalRequest {
+            reason: Some("writes outside the workspace".to_string()),
+            ..approval_request()
+        };
+
+        let _ = channel
+            .request_approval_attributed("operator", &request)
+            .await;
+
+        match rx.recv().await {
+            Some(TurnEvent::ApprovalRequest { reason, .. }) => {
+                assert_eq!(reason.as_deref(), Some("writes outside the workspace"));
+            }
+            other => panic!("expected an approval request event, got {other:?}"),
         }
     }
 

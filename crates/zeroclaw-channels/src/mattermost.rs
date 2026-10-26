@@ -1289,11 +1289,14 @@ impl Channel for MattermostChannel {
             (token, generation)
         };
 
+        // Mattermost renders posts as markdown; the reason is untrusted.
+        let reason = request.reason.as_deref().map(crate::util::escape_markdown);
         let text = crate::util::build_yesno_approval_prompt(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            reason.as_deref(),
         );
         // Armed from here on: every exit below — including a dropped future —
         // retires this registration and any post bound to it. Cleanup is keyed
@@ -4880,6 +4883,7 @@ mod approval_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            reason: None,
         }
     }
 
@@ -5084,6 +5088,7 @@ mod approval_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         // `send` fails against the unreachable test host, which surfaces as an

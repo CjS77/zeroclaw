@@ -971,6 +971,7 @@ impl Channel for SignalChannel {
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            request.reason.as_deref(),
         );
 
         let (tx, rx) = oneshot::channel();

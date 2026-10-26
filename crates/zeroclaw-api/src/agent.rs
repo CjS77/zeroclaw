@@ -133,6 +133,9 @@ pub enum TurnEvent {
         arguments_summary: String,
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
+        /// Why the operator is being asked, when whatever forced the prompt
+        /// gave a reason. Untrusted free text.
+        reason: Option<String>,
     },
     /// Older whole turns were dropped to fit either the context token budget or
     /// the configured turn limit. Surfaces a user-visible "context was cut

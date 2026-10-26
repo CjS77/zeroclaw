@@ -8669,11 +8669,16 @@ impl TelegramChannel {
         let position = Self::escape_html(&crate::util::approval_position_line(
             request.position_counter(),
         ));
+        // The reason is untrusted text, escaped like the args it follows.
+        let reason = Self::escape_html(&crate::util::approval_reason_line(
+            request.reason.as_deref(),
+        ));
         let text = format!(
             "\u{1f527} <b>{heading}</b>\n\n\
              {position}\
              {tool_label}: <code>{tool}</code>\n\
-             {args}\n\n\
+             {args}\n\
+             {reason}\n\
              {tap_instruction}",
         );
 
@@ -8739,8 +8744,9 @@ impl TelegramChannel {
                     // HTML-escaped one above would show its entities literally.
                     let plain_position =
                         crate::util::approval_position_line(request.position_counter());
+                    let plain_reason = crate::util::approval_reason_line(request.reason.as_deref());
                     let plain_text = format!(
-                        "🔧 {heading}\n\n{plain_position}{tool_label}: {}\n{}\n\n{tap_instruction}",
+                        "🔧 {heading}\n\n{plain_position}{tool_label}: {}\n{}\n{plain_reason}\n{tap_instruction}",
                         request.tool_name, request.arguments_summary
                     );
                     let mut plain_body = serde_json::json!({
@@ -11055,6 +11061,7 @@ mod tests {
             arguments_summary: "expr=1+1".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         let result = ch.request_approval("123", &request).await.unwrap();
@@ -11120,6 +11127,7 @@ mod tests {
             arguments_summary: "expr=1+1".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         let started = std::time::Instant::now();
@@ -23835,6 +23843,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
         let attributed = ch
             .request_approval_attributed("12345", &request)
@@ -23911,6 +23920,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
         let attributed = ch
             .request_approval_attributed_with_timeout("12345", &request, Duration::from_millis(100))
@@ -23961,6 +23971,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
         let waiter = {
             let ch = Arc::clone(&ch);
@@ -24107,6 +24118,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
         let mut waiter = Box::pin(ch.request_approval_attributed("12345", &request));
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -24169,6 +24181,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            reason: None,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
@@ -24264,6 +24277,7 @@ mod tests {
             arguments_summary: summary.clone(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
+            reason: None,
         };
 
         // Nothing resolves the pending oneshot; the short timeout returns a
@@ -24355,6 +24369,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 }),
+            reason: None,
         };
 
         let _ = ch.request_approval("12345", &request).await;
@@ -24370,6 +24385,84 @@ mod tests {
                 "\u{1f527} <b>{heading}</b>\n\n{tool_label}: <code>shell</code>\nls -la\n\n{tap_instruction}",
             ),
             "a one-call batch renders exactly as an unpositioned card"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_card_escapes_the_reason_in_html_and_keeps_it_raw_in_the_plain_fallback() {
+        use wiremock::matchers::{body_string_contains, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Reject the HTML send so both renderers run: the reason must be
+        // escaped on the HTML card and literal on the plain-text retry.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_string_contains("parse_mode"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let reason = "<b>trust me</b> & <a href=\"https://evil.example\">go</a>";
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: None,
+            reason: Some(reason.to_string()),
+        };
+
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "HTML send then plain-text retry");
+
+        let raw_line = crate::util::approval_reason_line(Some(reason));
+        let escaped_line = TelegramChannel::escape_html(&raw_line);
+
+        let html: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let html_text = html["text"].as_str().unwrap();
+        assert!(
+            html_text.contains(&format!("ls -la\n{escaped_line}\n")),
+            "the escaped reason follows the args; want {escaped_line:?}, got {html_text}"
+        );
+        assert!(
+            !html_text.contains("<b>trust me</b>") && !html_text.contains("<a href"),
+            "the reason must not inject HTML; got {html_text}"
+        );
+        assert!(html_text.contains("&lt;b&gt;trust me&lt;/b&gt; &amp; &lt;a href="));
+
+        let plain: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            plain.get("parse_mode").is_none(),
+            "the retry is the plain-text fallback"
+        );
+        let plain_text = plain["text"].as_str().unwrap();
+        assert!(
+            plain_text.contains(&format!("ls -la\n{raw_line}\n")),
+            "the fallback shows the reason literally; want {raw_line:?}, got {plain_text}"
         );
     }
 

@@ -154,10 +154,10 @@ pub enum ToolCallDecision {
     Cancel(String),
     /// Run the call only if an operator approves it now: prompt whatever the
     /// risk profile says, and ignore the session's "Always" answers for this
-    /// call, as for a tool the profile lists in `always_ask`; read-only mode
-    /// still blocks the call if the operator approves it. When no operator can
-    /// be asked, as in a scheduled turn, the call is not run, and the reason is
-    /// in its result. An operator's "Always" answer still adds the tool to the
+    /// call, as for a tool the profile lists in `always_ask`. The prompt shows
+    /// the reason. Once approved, the call is still subject to read-only mode.
+    /// When no operator can be asked, as in a scheduled turn, the call is not
+    /// run, and the reason is in its result. An operator's "Always" answer still adds the tool to the
     /// session's list, so later calls the hook does not ask about skip the
     /// prompt.
     Ask {

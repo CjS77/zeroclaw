@@ -20658,6 +20658,7 @@ mod approval_route_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            reason: None,
         }
     }
 

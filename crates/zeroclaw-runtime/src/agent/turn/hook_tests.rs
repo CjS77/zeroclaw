@@ -641,3 +641,36 @@ async fn a_hook_ask_prompts_in_read_only_mode() {
         "the call's result gives the hook's reason"
     );
 }
+
+#[tokio::test]
+async fn the_prompt_for_a_hook_ask_carries_the_reason() {
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&supervised_profile());
+    let approver = ScriptedApprover::answering(vec![
+        ChannelApprovalResponse::Approve,
+        ChannelApprovalResponse::Approve,
+    ]);
+    let prompts = Arc::clone(&approver.prompts);
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, _) = run_turn(
+        Turn {
+            approval: Some(&approval),
+            channel: Some(&approver),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup", "lookup"]),
+        vec![tool],
+        &deciding_hooks(Some(serde_json::json!({"n": 1})), false),
+    )
+    .await;
+
+    result.expect("turn completes");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let reasons: Vec<_> = prompts
+        .lock()
+        .expect("prompt lock")
+        .iter()
+        .map(|prompt| prompt.reason.clone())
+        .collect();
+    assert_eq!(reasons, vec![None, Some(REASON.to_string())]);
+}

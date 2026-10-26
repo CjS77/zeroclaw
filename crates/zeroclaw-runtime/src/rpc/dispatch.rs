@@ -13715,12 +13715,14 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             tool_name,
             arguments_summary,
             timeout_secs,
+            reason,
         } => SessionUpdateEvent::ApprovalRequest {
             session_id: session_id.to_string(),
             request_id: request_id.clone(),
             tool_name: tool_name.clone(),
             arguments_summary: arguments_summary.clone(),
             timeout_secs: *timeout_secs,
+            reason: reason.clone(),
         },
         TurnEvent::HistoryTrimmed {
             dropped_messages,
@@ -27417,6 +27419,7 @@ mod tests {
             tool_name: "bash".into(),
             arguments_summary: "rm -rf /".into(),
             timeout_secs: 30,
+            reason: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -27424,6 +27427,21 @@ mod tests {
         assert_eq!(v["params"]["request_id"], "ar_1");
         assert_eq!(v["params"]["tool_name"], "bash");
         assert_eq!(v["params"]["timeout_secs"], 30);
+        assert!(v["params"].get("reason").is_none(), "no reason, no field");
+    }
+
+    #[test]
+    fn approval_request_notification_carries_the_reason() {
+        let event = TurnEvent::ApprovalRequest {
+            request_id: "ar_2".into(),
+            tool_name: "bash".into(),
+            arguments_summary: "rm -rf /".into(),
+            timeout_secs: 30,
+            reason: Some("deletes outside the workspace".into()),
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["reason"], "deletes outside the workspace");
     }
 
     #[test]

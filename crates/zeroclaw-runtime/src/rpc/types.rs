@@ -1752,6 +1752,10 @@ pub enum SessionUpdateEvent {
         tool_name: String,
         arguments_summary: String,
         timeout_secs: u64,
+        /// Why the operator is being asked, when whatever forced the prompt
+        /// gave a reason. Omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
     /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
@@ -2279,10 +2283,15 @@ mod tests {
             tool_name: "shell".into(),
             arguments_summary: "ls".into(),
             timeout_secs: 30,
+            reason: None,
         };
         let v = serde_json::to_value(evt).unwrap();
         assert_eq!(v["type"], json!("approval_request"));
         assert!(v.get("tool_name").is_some(), "got: {v}");
+        assert!(
+            v.get("reason").is_none(),
+            "an absent reason is omitted; got: {v}"
+        );
 
         let evt = SessionUpdateEvent::TurnComplete {
             session_id: "s".into(),

@@ -120,6 +120,12 @@ pub struct ChannelApprovalRequest {
     /// count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<ApprovalPosition>,
+    /// Why the operator is being asked, when whatever forced the prompt gave
+    /// a reason. This is untrusted text (a hook may echo model output), so
+    /// every adapter that renders it must escape it for its surface and keep
+    /// it to one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl ChannelApprovalRequest {
@@ -1780,5 +1786,38 @@ mod tests {
         assert!(
             matches!(back, ChannelApprovalResponse::DenyWithEdit { replacement } if replacement == "new content")
         );
+    }
+
+    #[test]
+    fn approval_request_without_reason_still_deserializes() {
+        // A payload from a peer that predates the field must still parse.
+        let old = serde_json::json!({
+            "tool_name": "shell",
+            "arguments_summary": "ls -la",
+        });
+        let parsed: ChannelApprovalRequest = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.reason, None);
+    }
+
+    #[test]
+    fn approval_request_serializes_reason_only_when_present() {
+        let mut request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: None,
+            reason: None,
+        };
+        let without = serde_json::to_value(&request).unwrap();
+        assert!(
+            without.get("reason").is_none(),
+            "an absent reason stays off the wire; got {without}"
+        );
+
+        request.reason = Some("touches production".to_string());
+        let with = serde_json::to_value(&request).unwrap();
+        assert_eq!(with["reason"], "touches production");
+        let back: ChannelApprovalRequest = serde_json::from_value(with).unwrap();
+        assert_eq!(back.reason.as_deref(), Some("touches production"));
     }
 }
