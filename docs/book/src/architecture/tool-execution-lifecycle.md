@@ -107,7 +107,9 @@ two atomic full-file writes remain parallel-eligible.
 
 Preparation happens before the executor runs a tool:
 
-1. `before_tool_call` hooks may cancel or rewrite the name/arguments.
+1. `before_tool_call` hooks may cancel or rewrite the name/arguments. The
+   hook context names the turn the call belongs to: turn id, agent alias,
+   channel, reply target and the turn's `IngressContext`.
 2. Channel delivery defaults may be injected for channel-aware tools.
 3. The runtime clears any "approved" marker in arguments.
 4. The approval gate evaluates the tool against the `ApprovalManager`.

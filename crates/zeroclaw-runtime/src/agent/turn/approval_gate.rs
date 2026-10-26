@@ -327,6 +327,7 @@ mod tests {
         channel: Option<&'a dyn Channel>,
     ) -> TurnCtx<'a> {
         TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             parent_agent_alias: None,
             observer,
             provider_name: "stub",
@@ -682,6 +683,7 @@ mod tests {
         let pacing = PacingConfig::default();
         let cancel = CancellationToken::new();
         let ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "test",
             model: "test-model",

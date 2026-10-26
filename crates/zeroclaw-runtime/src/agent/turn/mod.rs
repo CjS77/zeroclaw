@@ -9,6 +9,8 @@ pub(crate) mod events;
 pub(crate) mod execution;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
+#[cfg(test)]
+mod hook_tests;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
 pub(crate) mod media_degrade;
@@ -1859,6 +1861,7 @@ async fn run_tool_call_loop_impl<'a>(
         draft_reasoning: knobs.draft_reasoning,
         turn_id,
         agent_alias,
+        ingress: &ingress,
         parent_agent_alias,
         serving_provider_name: None,
         serving_model: None,
@@ -6341,6 +6344,7 @@ mod active_route_context_tests {
         let dedup_exempt_tools = Vec::new();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
         let base_ctx = TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer: &observer,
             provider_name: "custom.text",
             model: "text-model",

@@ -3,18 +3,80 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::channel::ChannelMessage;
+use crate::ingress::IngressContext;
 use crate::model_provider::{ChatMessage, ChatResponse};
 use crate::tool::ToolResult;
+
+/// The turn a tool call belongs to, as the runtime stamped it when the turn
+/// started.
+///
+/// Every value is runtime-owned: none is taken from the model's output or the
+/// tool call's arguments, so a hook can base policy on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HookTurnContext {
+    /// The turn's id, the `trace_id` on the turn's log records.
+    pub turn_id: String,
+    /// The alias of the agent whose policy and tools the turn runs with.
+    pub agent_alias: Option<String>,
+    /// The channel the turn runs on, as the runtime names it in its logs, such
+    /// as `"cli"` for a CLI or scheduled turn.
+    pub channel: String,
+    /// Where the channel delivers the turn's replies, such as a chat room.
+    pub reply_target: Option<String>,
+    /// The turn's ingress envelope: its sender, origin and, for an internally
+    /// driven turn, the principal that started it.
+    pub ingress: IngressContext,
+}
+
+impl HookTurnContext {
+    /// Build the context of one turn. `agent_alias` names the agent the turn
+    /// runs as; `reply_target` is where the channel delivers its replies.
+    pub fn new(
+        turn_id: impl Into<String>,
+        agent_alias: Option<String>,
+        channel: impl Into<String>,
+        reply_target: Option<String>,
+        ingress: IngressContext,
+    ) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            agent_alias,
+            channel: channel.into(),
+            reply_target,
+            ingress,
+        }
+    }
+}
 
 /// Opaque runtime context for one tool-call hook phase.
 ///
 /// Correlated contexts carry one stable identity across the before and after
 /// phases. Uncorrelated contexts are phase-local and must not be used to pair
 /// callbacks or retain attribution-sensitive state.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Equality and hashing follow the identity alone, so a context can key a
+/// map whether or not it carries its turn.
+#[derive(Debug, Clone)]
 pub struct ToolCallHookContext {
     invocation_id: String,
     correlated: bool,
+    turn: Option<HookTurnContext>,
+}
+
+impl PartialEq for ToolCallHookContext {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.invocation_id, self.correlated) == (&other.invocation_id, other.correlated)
+    }
+}
+
+impl Eq for ToolCallHookContext {}
+
+impl std::hash::Hash for ToolCallHookContext {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.invocation_id.hash(state);
+        self.correlated.hash(state);
+    }
 }
 
 impl ToolCallHookContext {
@@ -26,6 +88,7 @@ impl ToolCallHookContext {
         Self {
             invocation_id: invocation_id.into(),
             correlated: true,
+            turn: None,
         }
     }
 
@@ -34,7 +97,21 @@ impl ToolCallHookContext {
         Self {
             invocation_id: invocation_id.into(),
             correlated: false,
+            turn: None,
         }
+    }
+
+    /// Attach the turn the call belongs to.
+    #[must_use]
+    pub fn with_turn(mut self, turn: HookTurnContext) -> Self {
+        self.turn = Some(turn);
+        self
+    }
+
+    /// The turn the call belongs to. `None` when the caller ran the hook
+    /// outside a turn, such as through the legacy context-free entry points.
+    pub fn turn(&self) -> Option<&HookTurnContext> {
+        self.turn.as_ref()
     }
 
     /// Return the opaque phase or invocation identity.
@@ -217,6 +294,25 @@ mod tests {
         assert!(!ok.is_cancel());
         let cancel: HookResult<String> = HookResult::Cancel("blocked".into());
         assert!(cancel.is_cancel());
+    }
+
+    #[test]
+    fn tool_call_context_carries_its_turn_only_when_attached() {
+        let bare = ToolCallHookContext::new("turn-1:0:0");
+        assert_eq!(bare.turn(), None);
+
+        let turn = HookTurnContext::new(
+            "turn-1",
+            Some("assistant".into()),
+            "matrix",
+            Some("!room:example.org".into()),
+            IngressContext::channel(),
+        );
+        let stamped = bare.clone().with_turn(turn.clone());
+        assert_eq!(stamped.turn(), Some(&turn));
+        assert_eq!(stamped, bare, "the turn is not part of the identity");
+        assert_eq!(stamped.invocation_id(), "turn-1:0:0");
+        assert!(stamped.is_correlated());
     }
 
     #[test]

@@ -120,7 +120,7 @@ pub(crate) async fn abandon_unexecuted_prepared_contexts(
         if completed.contains(call_idx) {
             continue;
         }
-        let context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *call_idx);
+        let context = ctx.tool_call_hook_context(iteration, *call_idx);
         hooks.fire_tool_call_abandoned(&context, &call.name).await;
     }
 }
@@ -154,7 +154,7 @@ pub(crate) async fn prepare_tool_calls(
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
-        let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, idx);
+        let hook_context = ctx.tool_call_hook_context(iteration, idx);
         if let Some(hooks) = ctx.hooks {
             match hooks
                 .run_before_tool_call_with_context(
@@ -496,6 +496,7 @@ mod tests {
         on_delta: &'a mpsc::Sender<DraftEvent>,
     ) -> TurnCtx<'a> {
         TurnCtx {
+            ingress: &crate::agent::turn::context::TEST_INGRESS,
             observer,
             provider_name: "test",
             model: "test-model",

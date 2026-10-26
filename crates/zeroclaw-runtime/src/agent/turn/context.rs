@@ -10,6 +10,8 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
+use zeroclaw_api::hook::{HookTurnContext, ToolCallHookContext};
+use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_config::schema::{PacingConfig, ResolvedContextLimits, StreamReasoningMode};
 
 pub(crate) struct TurnCtx<'a> {
@@ -32,6 +34,8 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) draft_reasoning: StreamReasoningMode,
     pub(crate) turn_id: &'a str,
     pub(crate) agent_alias: Option<&'a str>,
+    /// The turn's ingress envelope, stamped by the entry layer.
+    pub(crate) ingress: &'a IngressContext,
     /// The delegating agent's alias when this loop is a nested cross-agent
     /// execution (a live SOP step naming a different agent): `agent_alias` is
     /// the EFFECTIVE agent whose policy/tools execute; this keeps the parent
@@ -98,10 +102,28 @@ impl<'a> TurnCtx<'a> {
             draft_reasoning: self.draft_reasoning,
             turn_id: self.turn_id,
             agent_alias: self.agent_alias,
+            ingress: self.ingress,
             parent_agent_alias: self.parent_agent_alias,
             serving_provider_name: Some(provider_name.to_string()),
             serving_model: Some(model.to_string()),
         }
+    }
+
+    /// The hook context for one tool call of this turn: its correlated
+    /// identity, stamped with the turn the call belongs to.
+    pub(crate) fn tool_call_hook_context(
+        &self,
+        iteration: usize,
+        call_index: usize,
+    ) -> ToolCallHookContext {
+        let turn = HookTurnContext::new(
+            self.turn_id,
+            self.agent_alias.map(str::to_owned),
+            self.channel_name,
+            self.channel_reply_target.map(str::to_owned),
+            self.ingress.clone(),
+        );
+        crate::hooks::tool_call_hook_context(self.turn_id, iteration, call_index).with_turn(turn)
     }
 
     pub(crate) fn meta(&self) -> TurnMeta<'a> {
@@ -113,3 +135,8 @@ impl<'a> TurnCtx<'a> {
         }
     }
 }
+
+/// Ingress for test turn contexts that don't exercise ingress.
+#[cfg(test)]
+pub(crate) static TEST_INGRESS: std::sync::LazyLock<IngressContext> =
+    std::sync::LazyLock::new(IngressContext::sub_turn);
