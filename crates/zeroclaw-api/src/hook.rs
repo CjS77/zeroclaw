@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
 
-use crate::channel::ChannelMessage;
+use crate::channel::{AttributedApprovalResponse, ChannelMessage};
 use crate::ingress::IngressContext;
 use crate::model_provider::{ChatMessage, ChatResponse};
 use crate::tool::ToolResult;
@@ -253,6 +253,24 @@ pub trait HookHandler: Send + Sync {
     /// the first place, and treat abandonment as a best-effort release signal
     /// rather than a guarantee.
     async fn on_tool_call_abandoned(&self, _context: &ToolCallHookContext, _tool: &str) {}
+    /// Observe the answer to a tool call's approval prompt.
+    ///
+    /// Fired once for each call the approval gate needed an operator's answer
+    /// for, after the answer is recorded and before the call runs or is
+    /// denied, with the call's context. `response.source` says whether an
+    /// operator answered or the runtime denied the call because none could.
+    ///
+    /// Not fired when the turn is cancelled while the prompt is pending, nor
+    /// when a channel without approval prompts hands a shell call back to the
+    /// shell tool's own checks. The runtime awaits the handlers before the
+    /// call runs, so they should return promptly.
+    async fn on_tool_call_approval(
+        &self,
+        _context: &ToolCallHookContext,
+        _tool: &str,
+        _response: &AttributedApprovalResponse,
+    ) {
+    }
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
 
