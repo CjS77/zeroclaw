@@ -154,17 +154,14 @@ pub(crate) async fn prepare_tool_calls(
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
+        let mut hook_approval = None;
         let hook_context = ctx.tool_call_hook_context(iteration, idx);
         if let Some(hooks) = ctx.hooks {
-            match hooks
-                .run_before_tool_call_with_context(
-                    &hook_context,
-                    tool_name.clone(),
-                    tool_args.clone(),
-                )
-                .await
-            {
-                crate::hooks::HookResult::Cancel(reason) => {
+            let decision = hooks
+                .run_before_tool_call_decision(&hook_context, tool_name.clone(), tool_args.clone())
+                .await;
+            match crate::hooks::split_tool_call_decision(decision) {
+                Err(reason) => {
                     // The before phase ran, so this context's only terminal
                     // lifecycle operation is abandonment.
                     abandon_prepared_context(ctx, &hook_context, &tool_name).await;
@@ -213,9 +210,10 @@ pub(crate) async fn prepare_tool_calls(
                         Some((call.name.clone(), call.tool_call_id.clone(), outcome));
                     continue;
                 }
-                crate::hooks::HookResult::Continue((name, args)) => {
+                Ok((name, args, approval)) => {
                     tool_name = name;
                     tool_args = args;
+                    hook_approval = approval;
                 }
             }
         }
@@ -231,10 +229,10 @@ pub(crate) async fn prepare_tool_calls(
 
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
 
-        let requires_prompt = ctx
-            .approval
-            .map(|mgr| mgr.needs_approval(&tool_name))
-            .unwrap_or(false);
+        let requires_prompt = ctx.approval.is_some_and(|mgr| {
+            mgr.approval_requirement_with_hook(&tool_name, hook_approval.as_ref())
+                == crate::approval::ApprovalRequirement::Prompt
+        });
         let reentrant_agent_tool =
             crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
         // Signature this call holds in the turn-scoped guard while its
@@ -299,33 +297,37 @@ pub(crate) async fn prepare_tool_calls(
             index: u32::try_from(idx + 1).unwrap_or(u32::MAX),
             total: u32::try_from(tool_calls.len()).unwrap_or(u32::MAX),
         };
-        let approved =
-            match gate_tool_approval(ctx, &tool_name, &tool_args, iteration, position).await {
-                ApprovalGateOutcome::Proceed { approved } => approved,
-                ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
-                    // The before phase ran but this call will never execute:
-                    // its only terminal lifecycle operation is abandonment.
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    // Streaming consumers see the denied/replaced call and its
-                    // synthesized result (e.g. a DenyWithEdit replacement) as a
-                    // ToolCall/ToolResult pair, as the direct path always did.
-                    if let Some(tx) = ctx.event_tx {
-                        emit_tool_call_pair(tx, call, &outcome).await;
-                    }
-                    ordered_results[idx] =
-                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
-                    continue;
+        let hook = hook_approval.as_ref();
+        let approved = match gate_tool_approval(
+            ctx, &tool_name, &tool_args, iteration, position, hook,
+        )
+        .await
+        {
+            ApprovalGateOutcome::Proceed { approved } => approved,
+            ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
+                // The before phase ran but this call will never execute:
+                // its only terminal lifecycle operation is abandonment.
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                // Streaming consumers see the denied/replaced call and its
+                // synthesized result (e.g. a DenyWithEdit replacement) as a
+                // ToolCall/ToolResult pair, as the direct path always did.
+                if let Some(tx) = ctx.event_tx {
+                    emit_tool_call_pair(tx, call, &outcome).await;
                 }
-                ApprovalGateOutcome::Cancelled => {
-                    // Preparation aborts before execution takes ownership of
-                    // the retained contexts or the call awaiting approval.
-                    for (retained_context, retained_tool) in &retained_hook_contexts {
-                        abandon_prepared_context(ctx, retained_context, retained_tool).await;
-                    }
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    return Err(ToolLoopCancelled.into());
+                ordered_results[idx] =
+                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                continue;
+            }
+            ApprovalGateOutcome::Cancelled => {
+                // Preparation aborts before execution takes ownership of
+                // the retained contexts or the call awaiting approval.
+                for (retained_context, retained_tool) in &retained_hook_contexts {
+                    abandon_prepared_context(ctx, retained_context, retained_tool).await;
                 }
-            };
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                return Err(ToolLoopCancelled.into());
+            }
+        };
         // An approved call is not an approval loop: drop its signature from
         // the turn-scoped guard so a later identical call (a rerun the user
         // asked for, a re-check after an edit) gets a fresh approval prompt.

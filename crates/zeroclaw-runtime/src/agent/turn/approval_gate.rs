@@ -5,7 +5,7 @@ use super::context::TurnCtx;
 use super::events::StreamDelta;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
-use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
+use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse, HookApproval};
 use std::time::Duration;
 
 pub(crate) enum ApprovalGateOutcome {
@@ -18,17 +18,46 @@ pub(crate) enum ApprovalGateOutcome {
 /// Run the approval flow for one tool call (upstream loop body, approval
 /// section): resolve the tool's approval requirement, prompt interactively on
 /// CLI or via the channel's inline approval on non-interactive channels
-/// (falling back to auto-deny), and record the decision.
+/// (falling back to auto-deny), and record the decision. A before-tool-call
+/// hook's `hook` decision takes over the risk profile's requirement; a hook's
+/// ask that no operator can answer denies the call.
 pub(crate) async fn gate_tool_approval(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
     tool_args: &serde_json::Value,
     iteration: usize,
     position: zeroclaw_api::channel::ApprovalPosition,
+    hook: Option<&HookApproval>,
 ) -> ApprovalGateOutcome {
+    let hook_ask = match hook {
+        Some(HookApproval::Ask(reason)) => Some(reason.as_str()),
+        _ => None,
+    };
+    if ctx.approval.is_none()
+        && let Some(reason) = hook_ask
+    {
+        let denied = hook_ask_not_answered(tool_name, reason);
+        return deny_without_operator(ctx, tool_name, tool_args, iteration, denied).await;
+    }
+    if let (Some(mgr), Some(HookApproval::Approve(reason))) = (ctx.approval, hook)
+        && mgr.approval_requirement(tool_name) == ApprovalRequirement::Prompt
+        && mgr.approval_requirement_with_hook(tool_name, hook) == ApprovalRequirement::Approved
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({
+                    "tool": tool_name,
+                    "reason": reason,
+                    "trace_id": ctx.turn_id,
+                })),
+            "tool call approved by hook without an operator prompt"
+        );
+    }
     let mut approval_requirement = ctx
         .approval
-        .map(|mgr| mgr.approval_requirement(tool_name))
+        .map(|mgr| mgr.approval_requirement_with_hook(tool_name, hook))
         .unwrap_or(ApprovalRequirement::NotRequired);
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
@@ -90,7 +119,10 @@ pub(crate) async fn gate_tool_approval(
                 };
                 match response {
                     Ok(Some(a)) => Some(a),
-                    Ok(None) if mgr.unsupported_backchannel_may_fall_back(tool_name) => {
+                    Ok(None)
+                        if hook_ask.is_none()
+                            && mgr.unsupported_backchannel_may_fall_back(tool_name) =>
+                    {
                         return ApprovalGateOutcome::Proceed { approved: false };
                     }
                     Ok(None) => None,
@@ -165,7 +197,9 @@ pub(crate) async fn gate_tool_approval(
             // channel being unavailable.
             // Operators get the actionable advice through the WARN record below and
             // the UI, where changing policy is actually their decision to make.
-            let denied = if unanswerable {
+            let denied = if let (true, Some(reason)) = (unanswerable, hook_ask) {
+                hook_ask_not_answered(tool_name, reason)
+            } else if unanswerable {
                 format!(
                     "Tool call not executed: '{tool_name}' requires approval and no operator \
                      decision was available, so the runtime denied it by policy. This was not \
@@ -289,6 +323,59 @@ pub(crate) async fn gate_tool_approval(
     ApprovalGateOutcome::Proceed {
         approved: approval_requirement == ApprovalRequirement::Approved,
     }
+}
+
+/// The model-facing result of a call a hook asked an operator to approve
+/// when no operator could answer.
+fn hook_ask_not_answered(tool_name: &str, reason: &str) -> String {
+    format!(
+        "Tool call not executed: '{tool_name}' requires an operator's approval here \
+         (reason: {reason}) and no operator could answer, so the runtime denied it. \
+         This was not a user's decision."
+    )
+}
+
+/// Deny a call that needs an operator's approval in a turn with no approval
+/// manager, such as a scheduled job's.
+async fn deny_without_operator(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    iteration: usize,
+    denied: String,
+) -> ApprovalGateOutcome {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::Tool)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "model": ctx.model,
+                "iteration": iteration + 1,
+                "tool": tool_name,
+                "arguments": scrub_credentials(&tool_args.to_string()),
+                "result": denied,
+                "trace_id": ctx.turn_id,
+                "denied_by_runtime": true,
+            })),
+        "tool_call_result"
+    );
+    if let Some(tx) = ctx.on_delta {
+        let _ = tx
+            .send(StreamDelta::Status(format!(
+                "\u{274c} {tool_name}: {denied}\n"
+            )))
+            .await;
+    }
+    ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+        output: denied.clone(),
+        attachments: Vec::new(),
+        success: false,
+        error_reason: Some(denied),
+        duration: Duration::ZERO,
+        receipt: None,
+        output_data: None,
+    })
 }
 
 #[cfg(test)]
@@ -451,6 +538,7 @@ mod tests {
             &serde_json::json!({"command": "true"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            None,
         )
         .await;
         let unavailable = mode == "eof" || mode == "read_error";
@@ -562,6 +650,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            None,
         )
         .await
         {
@@ -586,6 +675,7 @@ mod tests {
             &serde_json::json!({"path": "x"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            None,
         )
         .await
         {
@@ -619,6 +709,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            None,
         )
         .await
         {
@@ -647,6 +738,7 @@ mod tests {
             &serde_json::json!({"path": "x"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            None,
         )
         .await
         {
@@ -715,6 +807,7 @@ mod tests {
             &arguments,
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            None,
         );
         tokio::pin!(approval_wait);
         let line = tokio::select! {

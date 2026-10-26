@@ -4,7 +4,10 @@
 use super::*;
 use crate::observability::NoopObserver;
 use std::sync::Mutex;
-use zeroclaw_api::hook::{HookTurnContext, ToolCallHookContext};
+use zeroclaw_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+};
+use zeroclaw_api::hook::{HookTurnContext, ToolCallDecision, ToolCallHookContext};
 use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_providers::{ChatResponse, ToolCall};
 
@@ -181,19 +184,20 @@ impl Default for Turn<'_> {
 
 const TURN_ID: &str = "turn-hook-tests";
 
+/// Run one turn; returns its result and the history it left.
 async fn run_turn(
     turn: Turn<'_>,
     model: &ScriptedModel,
     tools: Vec<Box<dyn crate::tools::Tool>>,
     hooks: &crate::hooks::HookRunner,
-) -> anyhow::Result<String> {
+) -> (anyhow::Result<String>, Vec<ChatMessage>) {
     let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
     let observer = NoopObserver;
     let pacing = zeroclaw_config::schema::PacingConfig::default();
     let mut history = vec![ChatMessage::user("go")];
     let mut crumb_present = false;
     let mut injected_preamble = None;
-    run_tool_call_loop(ToolLoop {
+    let result = run_tool_call_loop(ToolLoop {
         exec: ResolvedAgentExecution {
             model_access: ResolvedModelAccess {
                 model_provider: model,
@@ -246,7 +250,8 @@ async fn run_turn(
         served_route_sink: None,
         sop_reassembly: None,
     })
-    .await
+    .await;
+    (result, history)
 }
 
 fn counting_tool(
@@ -292,6 +297,7 @@ async fn tool_call_hooks_receive_the_turn_they_belong_to() {
         &hooks,
     )
     .await
+    .0
     .expect("turn completes");
 
     let expected = HookTurnContext::new(
@@ -329,6 +335,7 @@ async fn a_scheduled_turn_names_its_job_to_the_hook() {
         &hooks,
     )
     .await
+    .0
     .expect("turn completes");
 
     let seen = seen.lock().expect("recorder lock");
@@ -342,5 +349,295 @@ async fn a_scheduled_turn_names_its_job_to_the_hook() {
             job_id: "job-7".to_string(),
             job_name: Some("nightly".to_string()),
         })
+    );
+}
+
+const REASON: &str = "the recipient is not in the owner's contacts";
+
+/// Asks an operator about, or approves, every call whose arguments are
+/// `matching` (every call when `None`).
+struct DecidingHook {
+    matching: Option<serde_json::Value>,
+    approve: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::hooks::HookHandler for DecidingHook {
+    fn name(&self) -> &str {
+        "deciding"
+    }
+
+    async fn before_tool_call_decision(
+        &self,
+        _context: &ToolCallHookContext,
+        name: String,
+        args: serde_json::Value,
+    ) -> ToolCallDecision {
+        let reason = REASON.to_string();
+        match &self.matching {
+            Some(matching) if *matching != args => ToolCallDecision::Continue(name, args),
+            _ if self.approve => ToolCallDecision::Approve { name, args, reason },
+            _ => ToolCallDecision::Ask { name, args, reason },
+        }
+    }
+}
+
+fn deciding_hooks(matching: Option<serde_json::Value>, approve: bool) -> crate::hooks::HookRunner {
+    let mut hooks = crate::hooks::HookRunner::new();
+    hooks.register(Box::new(DecidingHook { matching, approve }));
+    hooks
+}
+
+/// Answers approval prompts from a script, and records every prompt.
+struct ScriptedApprover {
+    answers: Mutex<Vec<ChannelApprovalResponse>>,
+    prompts: Arc<Mutex<Vec<ChannelApprovalRequest>>>,
+}
+
+impl ScriptedApprover {
+    fn answering(answers: Vec<ChannelApprovalResponse>) -> Self {
+        Self {
+            answers: Mutex::new(answers),
+            prompts: Arc::default(),
+        }
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for ScriptedApprover {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::AcpChannel)
+    }
+    fn alias(&self) -> &str {
+        "scripted-approver"
+    }
+}
+
+#[async_trait::async_trait]
+impl Channel for ScriptedApprover {
+    fn name(&self) -> &str {
+        "scripted-approver"
+    }
+
+    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        self.prompts
+            .lock()
+            .expect("prompt lock")
+            .push(request.clone());
+        let mut answers = self.answers.lock().expect("answer lock");
+        Ok((!answers.is_empty()).then(|| answers.remove(0)))
+    }
+}
+
+fn supervised_profile() -> zeroclaw_config::schema::RiskProfileConfig {
+    zeroclaw_config::schema::RiskProfileConfig {
+        level: crate::security::AutonomyLevel::Supervised,
+        auto_approve: Vec::new(),
+        always_ask: Vec::new(),
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    }
+}
+
+fn mentions_reason(history: &[ChatMessage]) -> bool {
+    history
+        .iter()
+        .any(|message| message.content.contains(REASON))
+}
+
+/// The model calls `lookup` twice in one batch; the owner answers "Always"
+/// to the first prompt. Returns the prompts the owner saw and how often the
+/// tool ran.
+async fn always_then_second_lookup(hooks: &crate::hooks::HookRunner) -> (usize, usize) {
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&supervised_profile());
+    let approver = ScriptedApprover::answering(vec![
+        ChannelApprovalResponse::AlwaysApprove,
+        ChannelApprovalResponse::Approve,
+    ]);
+    let prompts = Arc::clone(&approver.prompts);
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, _) = run_turn(
+        Turn {
+            channel_name: "matrix",
+            reply_target: Some("!room:example.org"),
+            ingress: owner_ingress(),
+            approval: Some(&approval),
+            channel: Some(&approver),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup", "lookup"]),
+        vec![tool],
+        hooks,
+    )
+    .await;
+    result.expect("turn completes");
+    let prompted = prompts.lock().expect("prompt lock").len();
+    (prompted, runs.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn an_always_answer_skips_later_prompts_for_the_tool() {
+    let (prompted, ran) = always_then_second_lookup(&crate::hooks::HookRunner::new()).await;
+    assert_eq!((prompted, ran), (1, 2));
+}
+
+#[tokio::test]
+async fn a_hook_ask_prompts_despite_an_earlier_always_answer() {
+    let hooks = deciding_hooks(Some(serde_json::json!({"n": 1})), false);
+    let (prompted, ran) = always_then_second_lookup(&hooks).await;
+    assert_eq!((prompted, ran), (2, 2));
+}
+
+#[tokio::test]
+async fn a_hook_ask_in_a_scheduled_turn_does_not_run_the_call() {
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, history) = run_turn(
+        Turn {
+            ingress: IngressContext::cron_job("job-7", None),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup"]),
+        vec![tool],
+        &deciding_hooks(None, false),
+    )
+    .await;
+
+    result.expect("turn completes");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        mentions_reason(&history),
+        "the call's result gives the hook's reason"
+    );
+}
+
+#[tokio::test]
+async fn a_hook_ask_with_no_channel_to_prompt_does_not_run_the_call() {
+    let profile = zeroclaw_config::schema::RiskProfileConfig {
+        auto_approve: vec!["lookup".to_string()],
+        ..supervised_profile()
+    };
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&profile);
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, history) = run_turn(
+        Turn {
+            approval: Some(&approval),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup"]),
+        vec![tool],
+        &deciding_hooks(None, false),
+    )
+    .await;
+
+    result.expect("turn completes");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        mentions_reason(&history),
+        "the call's result gives the hook's reason"
+    );
+}
+
+#[tokio::test]
+async fn a_hook_approval_skips_the_profile_prompt() {
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&supervised_profile());
+    let approver = ScriptedApprover::answering(Vec::new());
+    let prompts = Arc::clone(&approver.prompts);
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, _) = run_turn(
+        Turn {
+            approval: Some(&approval),
+            channel: Some(&approver),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup"]),
+        vec![tool],
+        &deciding_hooks(None, true),
+    )
+    .await;
+
+    result.expect("turn completes");
+    assert!(prompts.lock().expect("prompt lock").is_empty());
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A shell call in a turn whose approval channel reports no approval
+/// support, which hands shell back to its own policy checks. Returns how often
+/// the call ran and whether its result gives the hook's reason.
+async fn shell_without_channel_prompts(hooks: &crate::hooks::HookRunner) -> (usize, bool) {
+    let approval =
+        crate::approval::ApprovalManager::for_non_interactive_backchannel(&supervised_profile());
+    let approver = ScriptedApprover::answering(Vec::new());
+    let (tool, runs) = counting_tool("shell");
+
+    let (result, history) = run_turn(
+        Turn {
+            approval: Some(&approval),
+            channel: Some(&approver),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["shell"]),
+        vec![tool],
+        hooks,
+    )
+    .await;
+
+    result.expect("turn completes");
+    (
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        mentions_reason(&history),
+    )
+}
+
+#[tokio::test]
+async fn shell_falls_back_to_its_own_checks_when_the_channel_cannot_prompt() {
+    let ran = shell_without_channel_prompts(&crate::hooks::HookRunner::new()).await;
+    assert_eq!(ran, (1, false));
+}
+
+#[tokio::test]
+async fn a_hook_ask_on_shell_does_not_fall_back_when_the_channel_cannot_prompt() {
+    let ran = shell_without_channel_prompts(&deciding_hooks(None, false)).await;
+    assert_eq!(ran, (0, true));
+}
+
+#[tokio::test]
+async fn a_hook_ask_prompts_in_read_only_mode() {
+    let profile = zeroclaw_config::schema::RiskProfileConfig {
+        level: crate::security::AutonomyLevel::ReadOnly,
+        ..supervised_profile()
+    };
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&profile);
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, history) = run_turn(
+        Turn {
+            approval: Some(&approval),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup"]),
+        vec![tool],
+        &deciding_hooks(None, false),
+    )
+    .await;
+
+    result.expect("turn completes");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        mentions_reason(&history),
+        "the call's result gives the hook's reason"
     );
 }

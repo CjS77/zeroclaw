@@ -72,6 +72,18 @@ pub struct ApprovalLogEntry {
     pub channel: String,
 }
 
+/// What a before-tool-call hook decided about approving one call, with the
+/// hook's reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HookApproval {
+    /// Prompt whatever the risk profile says, ignoring the session's "Always"
+    /// answers, as for an `always_ask` tool.
+    Ask(String),
+    /// Skip a prompt the risk profile would show, except for an `always_ask`
+    /// tool.
+    Approve(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalRequirement {
     Prompt,
@@ -273,6 +285,31 @@ impl ApprovalManager {
 
         // Default: supervised mode requires approval.
         ApprovalRequirement::Prompt
+    }
+
+    /// The approval requirement for a call once a hook has decided on it. A
+    /// hook's ask always prompts. Its approval only answers a prompt the
+    /// profile would show, and never one for an `always_ask` tool: where the
+    /// profile would not prompt, it grants nothing.
+    pub(crate) fn approval_requirement_with_hook(
+        &self,
+        tool_name: &str,
+        hook: Option<&HookApproval>,
+    ) -> ApprovalRequirement {
+        let profile = self.approval_requirement(tool_name);
+        match hook {
+            Some(HookApproval::Ask(_)) => ApprovalRequirement::Prompt,
+            Some(HookApproval::Approve(_))
+                if profile == ApprovalRequirement::Prompt && !self.is_always_ask(tool_name) =>
+            {
+                ApprovalRequirement::Approved
+            }
+            _ => profile,
+        }
+    }
+
+    fn is_always_ask(&self, tool_name: &str) -> bool {
+        self.always_ask.contains("*") || self.always_ask.contains(tool_name)
     }
 
     /// Whether an approval channel that explicitly reports no approval support
@@ -535,6 +572,107 @@ mod tests {
             level: AutonomyLevel::Full,
             ..RiskProfileConfig::default()
         }
+    }
+
+    // ── Hook decisions ──────────────────────────────────────
+
+    fn ask() -> HookApproval {
+        HookApproval::Ask("check with the owner".into())
+    }
+
+    fn approve() -> HookApproval {
+        HookApproval::Approve("routine".into())
+    }
+
+    #[test]
+    fn hook_ask_prompts_despite_full_autonomy_and_an_always_answer() {
+        let full = ApprovalManager::from_risk_profile(&full_config());
+        assert_eq!(
+            full.approval_requirement_with_hook("file_write", Some(&ask())),
+            ApprovalRequirement::Prompt
+        );
+
+        let supervised = ApprovalManager::from_risk_profile(&supervised_config());
+        supervised.record_decision(
+            "file_write",
+            &serde_json::json!({}),
+            &ApprovalResponse::Always,
+            "cli",
+        );
+        assert_eq!(
+            supervised.approval_requirement("file_write"),
+            ApprovalRequirement::Approved
+        );
+        assert_eq!(
+            supervised.approval_requirement_with_hook("file_write", Some(&ask())),
+            ApprovalRequirement::Prompt
+        );
+    }
+
+    #[test]
+    fn hook_approval_skips_the_profile_prompt_but_not_always_ask() {
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
+        assert_eq!(
+            mgr.approval_requirement("file_write"),
+            ApprovalRequirement::Prompt
+        );
+        assert_eq!(
+            mgr.approval_requirement_with_hook("file_write", Some(&approve())),
+            ApprovalRequirement::Approved
+        );
+        assert_eq!(
+            mgr.approval_requirement_with_hook("shell", Some(&approve())),
+            ApprovalRequirement::Prompt
+        );
+    }
+
+    #[test]
+    fn hook_ask_prompts_in_read_only_mode() {
+        let read_only = ApprovalManager::for_non_interactive(&RiskProfileConfig {
+            level: AutonomyLevel::ReadOnly,
+            ..RiskProfileConfig::default()
+        });
+        assert_eq!(
+            read_only.approval_requirement_with_hook("file_read", Some(&ask())),
+            ApprovalRequirement::Prompt
+        );
+        assert_eq!(
+            read_only.approval_requirement_with_hook("file_read", Some(&approve())),
+            ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[test]
+    fn hook_approval_grants_nothing_the_profile_would_not_prompt_for() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config_without_always_ask());
+        assert_eq!(
+            mgr.approval_requirement("shell"),
+            ApprovalRequirement::NotRequired
+        );
+        assert_eq!(
+            mgr.approval_requirement_with_hook("shell", Some(&approve())),
+            ApprovalRequirement::NotRequired
+        );
+    }
+
+    fn supervised_config_without_always_ask() -> RiskProfileConfig {
+        RiskProfileConfig {
+            always_ask: Vec::new(),
+            ..supervised_config()
+        }
+    }
+
+    #[test]
+    fn hook_decisions_leave_undecided_calls_to_the_profile() {
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
+        assert_eq!(
+            mgr.approval_requirement_with_hook("file_read", None),
+            ApprovalRequirement::Approved
+        );
+        assert_eq!(
+            mgr.approval_requirement_with_hook("file_write", None),
+            ApprovalRequirement::Prompt
+        );
     }
 
     // ── CLI prompt input ────────────────────────────────────

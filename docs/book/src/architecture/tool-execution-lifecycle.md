@@ -109,7 +109,17 @@ Preparation happens before the executor runs a tool:
 
 1. `before_tool_call` hooks may cancel or rewrite the name/arguments. The
    hook context names the turn the call belongs to: turn id, agent alias,
-   channel, reply target and the turn's `IngressContext`.
+   channel, reply target and the turn's `IngressContext`. Through
+   `before_tool_call_decision` a hook may also take over the approval
+   decision: `Ask` prompts an operator whatever the risk profile says,
+   ignoring the session's "Always" answers, and denies the call when no
+   operator can answer (a cron turn, a channel without approval prompts);
+   `Approve` answers a prompt the profile would show, as an operator's "yes"
+   would (for `shell`, that includes its command-level approval), but never
+   for an `always_ask` tool, and grants nothing where the profile would not
+   prompt. An `Ask` from any hook wins over an `Approve`, and an `Approve`
+   lapses if a later hook changes the call. Delegated sub-agent turns run
+   without hooks.
 2. Channel delivery defaults may be injected for channel-aware tools.
 3. The runtime clears any "approved" marker in arguments.
 4. The approval gate evaluates the tool against the `ApprovalManager`.
