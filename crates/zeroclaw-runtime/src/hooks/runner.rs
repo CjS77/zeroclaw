@@ -5,7 +5,7 @@ use futures_util::{FutureExt, future::join_all};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 
-use zeroclaw_api::channel::ChannelMessage;
+use zeroclaw_api::channel::{AttributedApprovalResponse, ChannelMessage};
 use zeroclaw_api::hook::{ToolCallDecision, ToolCallHookContext};
 use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
@@ -279,6 +279,33 @@ impl HookRunner {
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"hook": hook_name})),
                     "tool_call_abandoned hook panicked; continuing with remaining handlers"
+                );
+            }
+        });
+        join_all(futs).await;
+    }
+
+    /// Fire the answer to a tool call's approval prompt. Same parallel,
+    /// per-handler panic isolation as the other void hooks.
+    pub async fn fire_tool_call_approval(
+        &self,
+        context: &ToolCallHookContext,
+        tool: &str,
+        response: &AttributedApprovalResponse,
+    ) {
+        let futs = self.handlers.iter().map(|h| async move {
+            let hook_name = h.name();
+            if AssertUnwindSafe(h.on_tool_call_approval(context, tool, response))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"hook": hook_name})),
+                    "tool_call_approval hook panicked; continuing with remaining handlers"
                 );
             }
         });

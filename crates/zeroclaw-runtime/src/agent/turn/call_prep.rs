@@ -299,7 +299,13 @@ pub(crate) async fn prepare_tool_calls(
         };
         let hook = hook_approval.as_ref();
         let approved = match gate_tool_approval(
-            ctx, &tool_name, &tool_args, iteration, position, hook,
+            ctx,
+            &hook_context,
+            &tool_name,
+            &tool_args,
+            iteration,
+            position,
+            hook,
         )
         .await
         {

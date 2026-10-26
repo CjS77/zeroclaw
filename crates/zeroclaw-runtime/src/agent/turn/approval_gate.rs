@@ -7,6 +7,8 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse, HookApproval};
 use std::time::Duration;
+use zeroclaw_api::channel::{ApprovalSource, AttributedApprovalResponse, ChannelApprovalResponse};
+use zeroclaw_api::hook::ToolCallHookContext;
 
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
@@ -20,9 +22,11 @@ pub(crate) enum ApprovalGateOutcome {
 /// CLI or via the channel's inline approval on non-interactive channels
 /// (falling back to auto-deny), and record the decision. A before-tool-call
 /// hook's `hook` decision takes over the risk profile's requirement; a hook's
-/// ask that no operator can answer denies the call.
+/// ask that no operator can answer denies the call. Hooks hear every answer,
+/// the runtime's own denials included, under the call's `hook_context`.
 pub(crate) async fn gate_tool_approval(
     ctx: &TurnCtx<'_>,
+    hook_context: &ToolCallHookContext,
     tool_name: &str,
     tool_args: &serde_json::Value,
     iteration: usize,
@@ -36,6 +40,8 @@ pub(crate) async fn gate_tool_approval(
     if ctx.approval.is_none()
         && let Some(reason) = hook_ask
     {
+        let unanswered = runtime_denial(ApprovalSource::Unavailable);
+        report_approval(ctx, hook_context, tool_name, &unanswered).await;
         let denied = hook_ask_not_answered(tool_name, reason);
         return deny_without_operator(ctx, tool_name, tool_args, iteration, denied).await;
     }
@@ -72,7 +78,7 @@ pub(crate) async fn gate_tool_approval(
         // Non-interactive (channels): try the channel's inline
         // approval (e.g. Telegram inline keyboard) before falling
         // back to auto-deny.
-        let (decision, decided_by, unanswerable) = if mgr.is_non_interactive() {
+        let (decision, decided_by, unanswerable, answer) = if mgr.is_non_interactive() {
             let attributed = if let Some(ch) = ctx.channel {
                 let arguments_summary = crate::approval::summarize_args(&request.arguments);
                 let arguments_summary =
@@ -140,7 +146,7 @@ pub(crate) async fn gate_tool_approval(
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                             "Channel approval request failed"
                         );
-                        None
+                        Some(runtime_denial(ApprovalSource::Unreachable))
                     }
                 }
             } else {
@@ -149,6 +155,9 @@ pub(crate) async fn gate_tool_approval(
             // The deciding back-channel (when a fan-out bridge answered) rides
             // back on the response itself, so attribution can't be cross-wired
             // by a concurrent approval on the same channel instance.
+            let answer = attributed
+                .clone()
+                .unwrap_or_else(|| runtime_denial(ApprovalSource::Unavailable));
             let decided_by = attributed.as_ref().and_then(|a| a.decided_by.clone());
             // Whether an operator actually decided, taken from the response's own
             // provenance rather than inferred.
@@ -177,16 +186,25 @@ pub(crate) async fn gate_tool_approval(
                 // Channel doesn't support approval — auto-deny.
                 None => ApprovalResponse::No,
             };
-            (decision, decided_by, unanswerable)
+            (decision, decided_by, unanswerable, answer)
         } else {
             match mgr.prompt_cli(&request) {
-                Ok(decision) => (decision, None, false),
-                Err(_) => (ApprovalResponse::No, None, true),
+                Ok(decision) => {
+                    let answer = AttributedApprovalResponse::operator(channel_response(&decision));
+                    (decision, None, false, answer)
+                }
+                Err(_) => (
+                    ApprovalResponse::No,
+                    None,
+                    true,
+                    runtime_denial(ApprovalSource::Unavailable),
+                ),
             }
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+        report_approval(ctx, hook_context, tool_name, &answer).await;
 
         if decision == ApprovalResponse::No {
             // This string is fed back to the MODEL, so it states the outcome and
@@ -327,6 +345,35 @@ pub(crate) async fn gate_tool_approval(
     }
 }
 
+fn runtime_denial(source: ApprovalSource) -> AttributedApprovalResponse {
+    AttributedApprovalResponse::from_runtime(ChannelApprovalResponse::Deny, source)
+}
+
+/// The channel form of a CLI answer, the form approval hooks receive.
+fn channel_response(decision: &ApprovalResponse) -> ChannelApprovalResponse {
+    match decision {
+        ApprovalResponse::Yes => ChannelApprovalResponse::Approve,
+        ApprovalResponse::No => ChannelApprovalResponse::Deny,
+        ApprovalResponse::Always => ChannelApprovalResponse::AlwaysApprove,
+        ApprovalResponse::ReplaceWith(replacement) => ChannelApprovalResponse::DenyWithEdit {
+            replacement: replacement.clone(),
+        },
+    }
+}
+
+async fn report_approval(
+    ctx: &TurnCtx<'_>,
+    hook_context: &ToolCallHookContext,
+    tool_name: &str,
+    answer: &AttributedApprovalResponse,
+) {
+    if let Some(hooks) = ctx.hooks {
+        hooks
+            .fire_tool_call_approval(hook_context, tool_name, answer)
+            .await;
+    }
+}
+
 /// The model-facing result of a call a hook asked an operator to approve
 /// when no operator could answer.
 fn hook_ask_not_answered(tool_name: &str, reason: &str) -> String {
@@ -382,7 +429,7 @@ async fn deny_without_operator(
 
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalGateOutcome, gate_tool_approval};
+    use super::{ApprovalGateOutcome, ToolCallHookContext, gate_tool_approval};
     use crate::agent::turn::context::TurnCtx;
     use crate::approval::ApprovalManager;
     use crate::observability::NoopObserver;
@@ -536,6 +583,7 @@ mod tests {
         };
         let outcome = gate_tool_approval(
             &ctx,
+            &ToolCallHookContext::new("approval-gate-test"),
             "shell",
             &serde_json::json!({"command": "true"}),
             0,
@@ -648,6 +696,7 @@ mod tests {
 
         match gate_tool_approval(
             &ctx,
+            &ToolCallHookContext::new("approval-gate-test"),
             "shell",
             &serde_json::json!({"command": "ls"}),
             0,
@@ -673,6 +722,7 @@ mod tests {
 
         match gate_tool_approval(
             &ctx,
+            &ToolCallHookContext::new("approval-gate-test"),
             "file_write",
             &serde_json::json!({"path": "x"}),
             0,
@@ -707,6 +757,7 @@ mod tests {
 
         match gate_tool_approval(
             &ctx,
+            &ToolCallHookContext::new("approval-gate-test"),
             "shell",
             &serde_json::json!({"command": "ls"}),
             0,
@@ -736,6 +787,7 @@ mod tests {
 
         match gate_tool_approval(
             &ctx,
+            &ToolCallHookContext::new("approval-gate-test"),
             "file_write",
             &serde_json::json!({"path": "x"}),
             0,
@@ -803,8 +855,10 @@ mod tests {
         };
 
         let arguments = serde_json::json!({"command": "sleep 60"});
+        let hook_context = ToolCallHookContext::new("approval-gate-test");
         let approval_wait = gate_tool_approval(
             &ctx,
+            &hook_context,
             "shell",
             &arguments,
             0,

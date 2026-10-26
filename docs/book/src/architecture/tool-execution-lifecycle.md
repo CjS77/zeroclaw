@@ -139,7 +139,9 @@ Approval has different front doors:
 
 Approval is a pre-execution control. It is not a receipt, and it is not proof
 that a tool ran. Audit entries record the decision and the deciding channel or
-backchannel.
+backchannel. Hooks hear each answer through `on_tool_call_approval`, with the
+call's hook context and the answer's source, so a hook can tell an operator's
+"no" from the runtime denying a call no operator could answer.
 
 Prompt-required shell calls have an extra loop guard: if the agent repeats the
 same prompt-required shell call before approval, the loop aborts instead of

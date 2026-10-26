@@ -392,6 +392,7 @@ fn deciding_hooks(matching: Option<serde_json::Value>, approve: bool) -> crate::
 struct ScriptedApprover {
     answers: Mutex<Vec<ChannelApprovalResponse>>,
     prompts: Arc<Mutex<Vec<ChannelApprovalRequest>>>,
+    unreachable: bool,
 }
 
 impl ScriptedApprover {
@@ -399,6 +400,7 @@ impl ScriptedApprover {
         Self {
             answers: Mutex::new(answers),
             prompts: Arc::default(),
+            unreachable: false,
         }
     }
 }
@@ -435,6 +437,7 @@ impl Channel for ScriptedApprover {
             .lock()
             .expect("prompt lock")
             .push(request.clone());
+        anyhow::ensure!(!self.unreachable, "approver unreachable");
         let mut answers = self.answers.lock().expect("answer lock");
         Ok((!answers.is_empty()).then(|| answers.remove(0)))
     }
@@ -673,4 +676,206 @@ async fn the_prompt_for_a_hook_ask_carries_the_reason() {
         .map(|prompt| prompt.reason.clone())
         .collect();
     assert_eq!(reasons, vec![None, Some(REASON.to_string())]);
+}
+
+/// One approval answer a hook heard: the call's id, whether its turn came
+/// with it, the answer and who gave it.
+type HeardAnswer = (
+    String,
+    bool,
+    ChannelApprovalResponse,
+    zeroclaw_api::channel::ApprovalSource,
+);
+
+/// Records every approval answer it hears.
+#[derive(Default)]
+struct AnswerRecorder {
+    heard: Arc<Mutex<Vec<HeardAnswer>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::hooks::HookHandler for AnswerRecorder {
+    fn name(&self) -> &str {
+        "answer-recorder"
+    }
+
+    async fn on_tool_call_approval(
+        &self,
+        context: &ToolCallHookContext,
+        _tool: &str,
+        response: &zeroclaw_api::channel::AttributedApprovalResponse,
+    ) {
+        self.heard.lock().expect("answer lock").push((
+            context.invocation_id().to_string(),
+            context.turn().is_some(),
+            response.response.clone(),
+            response.source,
+        ));
+    }
+}
+
+fn answer_recording_hooks(ask: bool) -> (crate::hooks::HookRunner, Arc<Mutex<Vec<HeardAnswer>>>) {
+    let recorder = AnswerRecorder::default();
+    let heard = Arc::clone(&recorder.heard);
+    let mut hooks = crate::hooks::HookRunner::new();
+    hooks.register(Box::new(recorder));
+    if ask {
+        hooks.register(Box::new(DecidingHook {
+            matching: None,
+            approve: false,
+        }));
+    }
+    (hooks, heard)
+}
+
+#[tokio::test]
+async fn hooks_hear_each_owner_answer_with_the_calls_context() {
+    use zeroclaw_api::channel::ApprovalSource::Operator;
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&supervised_profile());
+    let approver = ScriptedApprover::answering(vec![
+        ChannelApprovalResponse::Approve,
+        ChannelApprovalResponse::Deny,
+        ChannelApprovalResponse::AlwaysApprove,
+    ]);
+    let (hooks, heard) = answer_recording_hooks(false);
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, _) = run_turn(
+        Turn {
+            approval: Some(&approval),
+            channel: Some(&approver),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup", "lookup", "lookup"]),
+        vec![tool],
+        &hooks,
+    )
+    .await;
+
+    result.expect("turn completes");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        *heard.lock().expect("answer lock"),
+        vec![
+            (
+                format!("{TURN_ID}:0:0"),
+                true,
+                ChannelApprovalResponse::Approve,
+                Operator
+            ),
+            (
+                format!("{TURN_ID}:0:1"),
+                true,
+                ChannelApprovalResponse::Deny,
+                Operator
+            ),
+            (
+                format!("{TURN_ID}:0:2"),
+                true,
+                ChannelApprovalResponse::AlwaysApprove,
+                Operator
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn hooks_hear_the_runtime_deny_a_call_no_operator_could_answer() {
+    use zeroclaw_api::channel::ApprovalSource::Unavailable;
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&supervised_profile());
+    let no_channel = Turn {
+        approval: Some(&approval),
+        ..Turn::default()
+    };
+    let scheduled = Turn {
+        ingress: IngressContext::cron_job("job-7", None),
+        ..Turn::default()
+    };
+
+    for (turn, ask) in [(no_channel, false), (scheduled, true)] {
+        let (hooks, heard) = answer_recording_hooks(ask);
+        let (tool, runs) = counting_tool("lookup");
+        let (result, _) = run_turn(
+            turn,
+            &ScriptedModel::calling(&["lookup"]),
+            vec![tool],
+            &hooks,
+        )
+        .await;
+
+        result.expect("turn completes");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            *heard.lock().expect("answer lock"),
+            vec![(
+                format!("{TURN_ID}:0:0"),
+                true,
+                ChannelApprovalResponse::Deny,
+                Unavailable
+            )]
+        );
+    }
+}
+
+#[tokio::test]
+async fn hooks_hear_an_unreachable_approver_as_the_runtime_denying() {
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&supervised_profile());
+    let approver = ScriptedApprover {
+        unreachable: true,
+        ..ScriptedApprover::answering(Vec::new())
+    };
+    let (hooks, heard) = answer_recording_hooks(false);
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, _) = run_turn(
+        Turn {
+            approval: Some(&approval),
+            channel: Some(&approver),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup"]),
+        vec![tool],
+        &hooks,
+    )
+    .await;
+
+    result.expect("turn completes");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        *heard.lock().expect("answer lock"),
+        vec![(
+            format!("{TURN_ID}:0:0"),
+            true,
+            ChannelApprovalResponse::Deny,
+            zeroclaw_api::channel::ApprovalSource::Unreachable
+        )]
+    );
+}
+
+#[tokio::test]
+async fn hooks_hear_nothing_for_calls_that_needed_no_answer() {
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&supervised_profile());
+    let approver = ScriptedApprover::answering(Vec::new());
+    let (mut hooks, heard) = answer_recording_hooks(false);
+    hooks.register(Box::new(DecidingHook {
+        matching: None,
+        approve: true,
+    }));
+    let (tool, runs) = counting_tool("lookup");
+
+    let (result, _) = run_turn(
+        Turn {
+            approval: Some(&approval),
+            channel: Some(&approver),
+            ..Turn::default()
+        },
+        &ScriptedModel::calling(&["lookup"]),
+        vec![tool],
+        &hooks,
+    )
+    .await;
+
+    result.expect("turn completes");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(heard.lock().expect("answer lock").is_empty());
 }
