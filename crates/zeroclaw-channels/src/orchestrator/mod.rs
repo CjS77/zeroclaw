@@ -4,6 +4,7 @@
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+pub mod chat_hooks;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
@@ -17652,13 +17653,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             media_pipeline: config.media_pipeline.clone(),
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
-            hooks: if config.hooks.enabled {
-                Some(Arc::new(
-                    zeroclaw_runtime::hooks::HookRunner::from_root_config(&config),
-                ))
-            } else {
-                None
-            },
+            hooks: chat_hooks::chat_hook_runner(&config),
             non_cli_excluded_tools: Arc::new(risk_profile.excluded_tools.clone()),
             autonomy_level: risk_profile.level,
             tool_call_dedup_exempt: Arc::new(agent.resolved.tool_call_dedup_exempt.clone()),

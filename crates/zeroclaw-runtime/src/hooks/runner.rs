@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ pub(crate) fn tool_call_hook_context(
 }
 
 pub struct HookRunner {
-    handlers: Vec<Box<dyn HookHandler>>,
+    handlers: Vec<Arc<dyn HookHandler>>,
 }
 
 static LEGACY_TOOL_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -118,6 +119,12 @@ impl HookRunner {
 
     /// Register a handler and re-sort by descending priority.
     pub fn register(&mut self, handler: Box<dyn HookHandler>) {
+        self.register_shared(Arc::from(handler));
+    }
+
+    /// Register a handler that other runners also hold, such as an embedder's hook
+    /// shared by every turn, and re-sort by descending priority.
+    pub fn register_shared(&mut self, handler: Arc<dyn HookHandler>) {
         self.handlers.push(handler);
         self.handlers
             .sort_by_key(|h| std::cmp::Reverse(h.priority()));
