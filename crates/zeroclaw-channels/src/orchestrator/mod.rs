@@ -10608,6 +10608,7 @@ async fn process_channel_message_body(
                 }),
                 tool_loop,
             );
+            let tool_loop = zeroclaw_api::inbound_turn::scope(&turn_id, &msg.id, tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
             let tool_loop = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
                 attempt_allowlist.clone(),
