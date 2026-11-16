@@ -8,6 +8,7 @@ pub mod conversation_binding;
 pub mod elicitation;
 pub mod grants;
 pub mod hook;
+pub mod inbound_turn;
 pub mod ingress;
 pub mod jsonrpc;
 pub mod lifecycle;
