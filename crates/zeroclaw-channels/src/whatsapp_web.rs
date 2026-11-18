@@ -1849,6 +1849,7 @@ impl WhatsAppWebChannel {
                 content,
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 thread_ts: None,
+                in_reply_to: None,
                 interruption_scope_id: None,
                 attachments,
                 subject: None,

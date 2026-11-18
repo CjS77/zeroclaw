@@ -344,6 +344,8 @@ mod tests {
                 recovery_key: None,
                 password: None,
                 mention_only: false,
+                require_verified_device: false,
+                allowed_devices: Default::default(),
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
                 ack_reactions: Some(true),
