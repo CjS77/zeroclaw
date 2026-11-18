@@ -4,6 +4,16 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
+/// Capabilities dropped from every container: all of them, since a shell command needs none.
+const CAP_DROP: &str = "ALL";
+/// Stops setuid binaries and file capabilities from raising a process's privileges.
+const SECURITY_OPT: &str = "no-new-privileges";
+/// Most processes one container may run, so a fork bomb can't exhaust the host's process table.
+const PIDS_LIMIT: &str = "256";
+/// A writable, size-capped `/tmp` under the read-only root, which tools such as LibreOffice and
+/// Python need; `nosuid,nodev` keep setuid binaries and device files out of it.
+const TMPFS_TMP: &str = "/tmp:rw,nosuid,nodev,size=256m";
+
 /// Canonicalization failures that the runtime layer can present through
 /// localized tool diagnostics without parsing an English error chain.
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +114,7 @@ impl DockerRuntime {
         }
 
         self.workspace_mount_path(workspace_dir)
+            .and_then(super::docker_subfolder::mount_source)
             .with_context(|| {
                 format!(
                     "Failed to validate workspace mount path {}",
@@ -154,7 +165,9 @@ impl DockerRuntime {
             .arg("run")
             .arg("--rm")
             .arg("--init")
-            .arg("--interactive");
+            .arg("--interactive")
+            .args(["--cap-drop", CAP_DROP, "--security-opt", SECURITY_OPT])
+            .args(["--pids-limit", PIDS_LIMIT, "--tmpfs", TMPFS_TMP]);
 
         let network = self.config.network.trim();
         if !network.is_empty() {
@@ -181,7 +194,11 @@ impl DockerRuntime {
         if let Some(host_workspace) = host_workspace {
             process
                 .arg("--volume")
-                .arg(format!("{}:/workspace:rw", host_workspace.display()))
+                .arg(format!(
+                    "{}:{}:rw",
+                    host_workspace.display(),
+                    super::docker_subfolder::mount_target()
+                ))
                 .arg("--workdir")
                 .arg("/workspace");
         }

@@ -1,4 +1,5 @@
 pub mod docker;
+pub mod docker_subfolder;
 pub mod executable;
 pub mod native;
 
