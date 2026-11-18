@@ -253,6 +253,10 @@ mod allowlist {
 }
 
 mod approval_args;
+mod device_check;
+#[cfg(test)]
+mod inbound_trust_tests;
+mod reply_fallback;
 
 // ─── approval ──────────────────────────────────────────────────────────────
 mod approval {
@@ -2114,6 +2118,7 @@ mod inbound {
     use matrix_sdk::{
         Client, Room, RoomState,
         config::SyncSettings,
+        deserialized_responses::EncryptionInfo,
         event_handler::RawEvent,
         ruma::{
             OwnedEventId, OwnedUserId, UserId,
@@ -2174,10 +2179,13 @@ mod inbound {
     ) {
         let handler_ctx = ctx.clone();
         let message_handler = client.add_event_handler(
-            move |ev: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
+            move |ev: OriginalSyncRoomMessageEvent,
+                  room: Room,
+                  raw: RawEvent,
+                  encryption_info: Option<EncryptionInfo>| {
                 let ctx = handler_ctx.clone();
                 async move {
-                    if let Err(e) = handle_message(ctx, ev, room, raw).await {
+                    if let Err(e) = handle_message(ctx, ev, room, raw, encryption_info).await {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -2486,6 +2494,7 @@ mod inbound {
         ev: OriginalSyncRoomMessageEvent,
         room: Room,
         raw: RawEvent,
+        encryption_info: Option<EncryptionInfo>,
     ) -> anyhow::Result<()> {
         if room.state() != RoomState::Joined {
             return Ok(());
@@ -2493,8 +2502,12 @@ mod inbound {
         if ev.sender == ctx.bot_user_id {
             return Ok(());
         }
+        if !super::device_check::admit(&ctx.config, &ev.sender, encryption_info.as_ref(), &room) {
+            return Ok(());
+        }
 
         let body = ctx_mod::body_for(&ev.content.msgtype);
+        let body = super::reply_fallback::own_words(&raw, body);
         let sender = ev.sender.as_str();
         let room_id = room.room_id().as_str();
         let allowed_peers = (ctx.peer_resolver)();
@@ -2599,7 +2612,11 @@ mod inbound {
         {
             match room.event(tid, None).await {
                 Ok(timeline_event) => {
-                    if let Some((root_sender, root_body)) =
+                    if super::device_check::admits_fetched(
+                        &ctx.config,
+                        &allowed_peers,
+                        &timeline_event,
+                    ) && let Some((root_sender, root_body)) =
                         extract_root_summary(timeline_event.into_raw())
                     {
                         content = format!(
@@ -2679,7 +2696,13 @@ mod inbound {
             };
             match parent {
                 Ok(timeline_event) => {
-                    if let Some(info) = parent_media_info(timeline_event.raw().clone()) {
+                    if let Some(info) = parent_media_info(timeline_event.raw().clone())
+                        && super::device_check::admits_fetched(
+                            &ctx.config,
+                            &allowed_peers,
+                            &timeline_event,
+                        )
+                    {
                         content = attach_media(
                             &room,
                             &info,
@@ -2723,6 +2746,7 @@ mod inbound {
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: outbound_anchor.clone(),
+            in_reply_to: reply_target.as_ref().map(ToString::to_string),
             interruption_scope_id: interruption_scope,
             attachments,
             subject: None,
@@ -2748,8 +2772,9 @@ mod inbound {
         ev: OriginalSyncRoomMessageEvent,
         room: Room,
         raw: RawEvent,
+        encryption_info: Option<EncryptionInfo>,
     ) -> anyhow::Result<()> {
-        handle_message(ctx, ev, room, raw).await
+        handle_message(ctx, ev, room, raw, encryption_info).await
     }
 
     async fn is_group_room(room: &Room) -> bool {
@@ -9036,9 +9061,15 @@ mod tests {
                 initial_sync_done: Arc::clone(&channel.initial_sync_done),
                 undecryptable_seen: Arc::clone(&channel.undecryptable_seen),
             };
-            inbound::handle_message_for_test(handler_ctx, event, room, RawEvent(raw.into_json()))
-                .await
-                .expect("Matrix inbound adapter accepts event");
+            inbound::handle_message_for_test(
+                handler_ctx,
+                event,
+                room,
+                RawEvent(raw.into_json()),
+                None,
+            )
+            .await
+            .expect("Matrix inbound adapter accepts event");
             let message = rx.recv().await.expect("adapter forwards channel message");
 
             assert_eq!(message.content, "hello");
@@ -10982,6 +11013,8 @@ mod tests {
                 stream_draft_delete: true,
                 stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
                 mention_only: false,
+                require_verified_device: false,
+                allowed_devices: Default::default(),
                 recovery_key: None,
                 password: password.map(String::from),
                 approval_timeout_secs: 300,

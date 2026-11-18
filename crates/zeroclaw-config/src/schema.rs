@@ -18639,6 +18639,22 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When true, an inbound event is admitted only if it was end-to-end
+    /// encrypted by a device of its sender that this client sees as
+    /// `Verified` (cross-signed by the sender's identity, which this client
+    /// has verified). Other events are dropped before anything reads them,
+    /// approval replies included. Default: `false`, which admits a sender by
+    /// user ID alone.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub require_verified_device: bool,
+    /// Device IDs each sender may use, keyed by Matrix user ID (e.g.
+    /// `"@alice:example.org" = ["ABCDEFGHIJ"]`). Read only when
+    /// `require_verified_device` is true. Empty (default) admits any verified
+    /// device; otherwise a sender with no entry is dropped.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub allowed_devices: HashMap<String, Vec<String>>,
     /// Optional Matrix recovery key for automatic E2EE key backup restore.
     /// When set, ZeroClaw recovers room keys and cross-signing secrets on startup.
     #[secret]
@@ -38006,6 +38022,8 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -38046,6 +38064,8 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -38232,6 +38252,8 @@ allowed_users = ["@u:matrix.org"]
                     stream_tool_arguments: vec![],
                     recovery_key: None,
                     mention_only: false,
+                    require_verified_device: false,
+                    allowed_devices: Default::default(),
                     password: None,
                     approval_timeout_secs: 300,
                     reply_in_thread: true,
@@ -48682,6 +48704,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -48733,6 +48757,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             ],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -48765,6 +48791,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -48798,6 +48826,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -48842,6 +48872,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 stream_tool_arguments: vec![],
                 recovery_key: None,
                 mention_only: false,
+                require_verified_device: false,
+                allowed_devices: Default::default(),
                 password: None,
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
@@ -48885,6 +48917,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 stream_tool_arguments: vec![],
                 recovery_key: None,
                 mention_only: false,
+                require_verified_device: false,
+                allowed_devices: Default::default(),
                 password: None,
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
@@ -48932,6 +48966,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 stream_reasoning: StreamReasoningMode::Status,
                 stream_tool_arguments: vec![],
                 mention_only: false,
+                require_verified_device: false,
+                allowed_devices: Default::default(),
                 recovery_key: None,
                 password: None,
                 approval_timeout_secs: 300,
@@ -49049,6 +49085,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -49093,6 +49131,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -49133,6 +49173,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
@@ -49180,6 +49222,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             ],
             recovery_key: None,
             mention_only: false,
+            require_verified_device: false,
+            allowed_devices: Default::default(),
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,

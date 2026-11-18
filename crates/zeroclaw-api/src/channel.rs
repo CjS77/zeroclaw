@@ -412,6 +412,10 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Platform identifier of the message this one replies to (Matrix: the
+    /// `m.in_reply_to` event ID, including a thread's fallback reply).
+    /// `None` when the message is not a reply or the channel doesn't say.
+    pub in_reply_to: Option<String>,
     /// Thread scope identifier for interruption/cancellation grouping.
     /// Distinct from `thread_ts` (reply anchor): this is `Some` only when the message
     /// is genuinely inside a reply thread and should be isolated from other threads.

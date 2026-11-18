@@ -15719,6 +15719,7 @@ data: [DONE]\n\n";
             channel_alias: Some("default".into()),
             timestamp: 0,
             thread_ts: None,
+            in_reply_to: None,
             interruption_scope_id: None,
             attachments: Vec::new(),
             subject: None,

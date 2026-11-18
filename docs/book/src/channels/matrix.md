@@ -120,6 +120,40 @@ rooms the bot answers in. Authorize senders with a [peer group](#who-can-talk-to
 
 {{#thread-context channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread"}}
 
+A thread's root message, and the media of a message being replied to, are
+added to the turn only when an allowed sender wrote them. When a reply starts
+with a quoted fallback of its parent (`> ` lines and a blank line), the quote
+is removed, and the parent's event ID is passed on as the message's
+`in_reply_to`.
+
+### Verified devices only
+
+The sender allowlist admits a Matrix user ID, so anyone signed in to that
+account on a new device is admitted too. To admit only devices you have
+verified, set:
+
+```toml
+[channels.matrix.mybot]
+# ...connection settings...
+require_verified_device = true
+
+# Optional: only these devices, per user.
+[channels.matrix.mybot.allowed_devices]
+"@alice:example.org" = ["ABCDEFGHIJ"]
+```
+
+With `require_verified_device = true`, an event is dropped unless it was
+encrypted by a device of its sender that the bot sees as verified:
+cross-signed by the sender's identity, which the bot's account has verified.
+Unencrypted messages are dropped. The check runs before anything else, so a
+refused device can't answer an approval prompt either. A thread root or a
+replied-to message from a refused device is not added to the turn. Each
+dropped event is logged at INFO with the sender, device and room.
+
+When `allowed_devices` is non-empty, the device must also be listed under its
+sender's user ID. A sender with no entry is dropped. `allowed_devices` is read
+only when `require_verified_device` is true.
+
 ## 3. Token path (alternative): obtaining `access_token` and `device_id`
 
 > [!IMPORTANT]
@@ -438,7 +472,7 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 - Always use canonical room IDs in `allowed_rooms`: aliases are not resolved for the inbound allowlist (they are resolved only for outbound `delivery.to`).
 - **Threading:** when `channels.matrix.reply_in_thread` is `true` (default), every bot reply lives in a thread rooted at the user's message. Top-level user messages open a fresh thread; existing threads are continued. The main room timeline only carries the user-initiated messages.
 - **Thread root context:** the first inbound message ZeroClaw sees in any given thread is prefixed with `[Thread root from @sender]: <root body>` so the agent has the conversation that triggered the reply. Threads the bot itself started skip the preamble. Tracking is in-memory only; after a daemon restart, the next message in each active thread re-injects the preamble exactly once.
-- **Inline-reply media:** `channels.matrix.mention_only = true` makes the bot ignore naked media uploads (no text body to mention against). When the user inline-replies to such a dropped event with a question (`@bot can you see this?`), ZeroClaw walks the reply's `m.relates_to.m.in_reply_to.event_id`, fetches the parent event, and pulls its media into the current message: the agent's vision pipeline sees the image even though the original upload was filtered out.
+- **Inline-reply media:** `channels.matrix.mention_only = true` makes the bot ignore naked media uploads (no text body to mention against). When the user inline-replies to such a dropped event with a question (`@bot can you see this?`), ZeroClaw walks the reply's `m.relates_to.m.in_reply_to.event_id`, fetches the parent event, and, when an allowed sender posted it, pulls its media into the current message: the agent's vision pipeline sees the image even though the original upload was filtered out.
 - **Attachments thread alongside text:** `room.send_attachment` calls carry an `AttachmentConfig::reply(...)` with `EnforceThread::Threaded` when a thread anchor is present, so PDFs / images / voice notes land inside the bot's thread instead of the main timeline.
 - **Outbound media markers:** the agent emits `[image:url|path]`, `[file:url|path]`, `[voice:url|path]`, `[video:...]`, `[audio:...]` (and uppercase / `[document:...]` aliases) inside its reply text; ZeroClaw fetches the bytes (HTTP for `http(s)://`, local read otherwise) and uploads as the appropriate Matrix message event. **Missing or unreadable targets are non-fatal:** the channel logs a warning, drops just that marker, and appends a `(note: I couldn't deliver the file at <path>.)` line so the operator sees what was attempted instead of a silently-dropped reply.
 - **Voice messages** (MSC3245): inbound `m.audio` events carrying the `org.matrix.msc3245.voice` field are saved to `{workspace_dir}/matrix_files/` and run through the agent's configured transcription provider so the agent gets both the transcript text and the source path. Outbound voice notes upload as `m.audio` with the voice flag + zero-waveform set, so Element renders the bubble as a voice note; in an encrypted room the audio is encrypted before upload like any other attachment. See [Model Providers](../providers/overview.md) for transcription provider setup.
